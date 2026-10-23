@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Template Builder</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <a
+          class="brand-logo-link"
+          href="https://projects-manage.bbcincorp.com/"
+          target="_blank"
+          rel="noopener noreferrer"
+          title="BBC Incorp"
+        >
+          <img
+            class="brand-logo"
+            src="/images/bbcincorp-logo.svg"
+            width="132"
+            height="32"
+            alt="BBC Incorp"
+          />
+        </a>
+        <span class="brand-divider" aria-hidden="true"></span>
+        <span class="brand-product">
+          <span class="brand-name">Template Builder</span>
+          <span class="badge">MVP</span>
+        </span>
+      </div>
+      <form id="apiKeyForm" class="topbar-auth" autocomplete="off">
+        <label class="field-inline" for="apiKey">
+          <span>API key</span>
+          <input
+            id="apiKey"
+            name="template-builder-key"
+            type="password"
+            value=""
+            placeholder="Your API key"
+            autocomplete="off"
+            autocapitalize="off"
+            autocorrect="off"
+            spellcheck="false"
+            required
+            class="api-key-input"
+          />
+        </label>
+        <button type="submit" id="submitApiKey" class="btn btn-secondary">Submit</button>
+        <span id="authStatus" class="auth-status" role="status" aria-live="polite" aria-atomic="true" hidden></span>
+      </form>
+    </header>
+
+    <aside class="sidebar">
+      <section class="sidebar-block">
+        <div class="section-head">
+          <h2>New draft</h2>
+        </div>
+        <form id="uploadForm" class="upload-form">
+          <label class="field" for="uploadName">
+            <span>Name</span>
+            <input id="uploadName" name="name" type="text" placeholder="Consent of Director" required />
+          </label>
+          <label class="field" for="uploadDesc">
+            <span>Description</span>
+            <input id="uploadDesc" name="description" type="text" placeholder="Optional" />
+          </label>
+          <label class="field file-field" for="uploadDocx">
+            <span>DOCX</span>
+            <input
+              id="uploadDocx"
+              name="docx"
+              type="file"
+              accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+              required
+            />
+          </label>
+          <button type="submit" class="btn btn-primary btn-block">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path d="M12 16V4M12 4l-4 4M12 4l4 4M4 20h16" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            Create draft
+          </button>
+        </form>
+      </section>
+
+      <section class="sidebar-block drafts-block">
+        <div class="section-head">
+          <h2>Drafts</h2>
+          <button type="button" id="refreshDrafts" class="btn btn-ghost btn-icon" title="Refresh drafts" aria-label="Refresh drafts">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path d="M20 12a8 8 0 1 1-2.34-5.66M20 4v5h-5" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </button>
+        </div>
+        <ul id="draftList" class="draft-list" aria-label="Draft list"></ul>
+        <p id="draftEmpty" class="empty-hint" hidden>No drafts yet. Upload a DOCX to start.</p>
+      </section>
+    </aside>
+
+    <main class="workspace">
+      <div class="workspace-title-row">
+        <div class="editor-meta">
+          <h1 id="draftTitle" class="page-title">Templates</h1>
+          <span id="draftMeta" class="meta-value">Upload or open a draft</span>
+        </div>
+        <div id="editorActions" class="editor-actions" hidden>
+          <button type="button" id="saveDraft" class="btn btn-secondary">Save mapping</button>
+          <button type="button" id="exportEjs" class="btn btn-primary" title="Export and download .ejs">
+            Download EJS
+          </button>
+        </div>
+      </div>
+
+      <pre id="statusBanner" class="status-banner" hidden role="status" aria-live="polite"></pre>
+
+      <div id="editorEmpty" class="workspace-empty">
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/>
+        </svg>
+        <p>Upload a DOCX with <code>{{variable}}</code> markers, map each variable to a Model field, then export EJS.</p>
+      </div>
+
+      <section id="editorSection" class="editor" hidden>
+        <div class="editor-stage">
+          <aside class="binding-rail" aria-label="Variable mapping">
+            <div class="rail-head">
+              <h2>Variable mapping</h2>
+              <p class="rail-sub">Map each <code>&lt;%= name %&gt;</code> to a CRM Model + field. Export is blocked until all are mapped.</p>
+            </div>
+
+            <div class="rail-block">
+              <div class="rail-block-head">
+                <h3>Variables</h3>
+                <span id="varsCount" class="rail-count">0</span>
+              </div>
+              <ul id="variableList" class="var-map-list" aria-label="Template variables"></ul>
+              <p id="variableEmpty" class="pick-empty" hidden>No <code>{{ }}</code> variables found in this DOCX.</p>
+            </div>
+
+            <pre id="result" class="output" aria-live="polite"></pre>
+          </aside>
+
+          <div class="editor-canvas">
+            <div class="canvas-head">
+              <h2>EJS preview</h2>
+              <span id="mapStatus" class="map-status" aria-live="polite"></span>
+            </div>
+            <div class="preview-split">
+              <label class="field field-fill" for="ejsContent">
+                <span class="sr-only">EJS content (read-only)</span>
+                <textarea id="ejsContent" spellcheck="false" autocomplete="off" readonly></textarea>
+              </label>
+              <iframe id="ejsPreview" class="ejs-preview" title="Rendered HTML preview" sandbox=""></iframe>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
