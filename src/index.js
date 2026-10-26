@@ -47,10 +47,13 @@ async function start() {
   });
 }
 
-start().catch((error) => {
-  // eslint-disable-next-line no-console
-  console.error('Failed to start:', error.message);
-  process.exit(1);
-});
+// Vercel/serverless imports this module as a handler — do not listen or exit the process.
+if (require.main === module) {
+  start().catch((error) => {
+    // eslint-disable-next-line no-console
+    console.error('Failed to start:', error.message);
+    process.exit(1);
+  });
+}
 
 module.exports = app;
