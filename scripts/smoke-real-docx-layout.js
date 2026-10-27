@@ -25,6 +25,10 @@ async function main() {
   console.log('has_margin_top_or_bottom', /margin-(top|bottom):/.test(r.ejsContent));
   console.log('has_line_height', /line-height:/.test(r.ejsContent));
   console.log('has_strong', /<strong>/.test(r.ejsContent));
+  const body = (r.ejsContent.match(/<body>([\s\S]*)<\/body>/) || [])[1] || '';
+  console.log('body_newlines', (body.match(/\n/g) || []).length);
+  console.log('nbsp_count', (body.match(/&nbsp;/g) || []).length);
+  console.log('filled_empty_p', /<p[^>]*>&nbsp;<\/p>/.test(body.replace(/\n\s*/g, '')));
   const styles = [];
   const re = /style="([^"]+)"/g;
   let m;

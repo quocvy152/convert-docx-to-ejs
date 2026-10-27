@@ -233,24 +233,144 @@ function mustacheToEjs(html) {
   return String(html || '').replace(MUSTACHE_RE, (_full, name) => `<%= ${name} %>`);
 }
 
+/**
+ * HTML collapses runs of spaces/tabs and empty block boxes. Word authors use both
+ * for vertical gaps and alignment padding — map them to &nbsp; so PDF/HTML keep them.
+ */
+function encodeTextWhitespace(text) {
+  return String(text || '')
+    .replace(/\t/g, '\u00A0\u00A0\u00A0\u00A0')
+    .replace(/ {2,}/g, (run) => '\u00A0'.repeat(run.length))
+    .replace(/\u00A0/g, '&nbsp;');
+}
+
+function preserveSignificantWhitespace(html) {
+  const s = String(html || '');
+  let out = '';
+  let i = 0;
+  while (i < s.length) {
+    if (s[i] === '<') {
+      const close = s.indexOf('>', i);
+      if (close === -1) {
+        out += s.slice(i);
+        break;
+      }
+      out += s.slice(i, close + 1);
+      i = close + 1;
+      continue;
+    }
+    let j = i;
+    while (j < s.length && s[j] !== '<') j += 1;
+    out += encodeTextWhitespace(s.slice(i, j));
+    i = j;
+  }
+
+  // Empty paragraphs (blank lines in Word) need a line box or they collapse.
+  return out.replace(/<(p|h[1-6]|li|td|th)(\s[^>]*)?>\s*<\/\1>/gi, '<$1$2>&nbsp;</$1>');
+}
+
+const BLOCK_TAG_RE =
+  /^(?:p|h[1-6]|div|table|thead|tbody|tfoot|tr|ul|ol|li|section|header|footer|article|blockquote)$/i;
+const VOID_TAG_RE = /^(?:br|hr|img|input|meta|link)$/i;
+
+function prettyPrintHtml(html) {
+  const raw = String(html || '').trim();
+  if (!raw) return '';
+
+  /** @type {string[]} */
+  const tokens = [];
+  const re = /(<[^>]+>)|([^<]+)/g;
+  let m;
+  while ((m = re.exec(raw)) !== null) {
+    tokens.push(m[0]);
+  }
+
+  let depth = 0;
+  const lines = [];
+
+  for (const token of tokens) {
+    if (token.startsWith('<')) {
+      const closeMatch = token.match(/^<\/\s*([a-z0-9]+)/i);
+      const openMatch = !closeMatch && token.match(/^<\s*([a-z0-9]+)/i);
+      const tagName = (closeMatch || openMatch)?.[1] || '';
+      const isBlock = BLOCK_TAG_RE.test(tagName);
+      const isVoid = VOID_TAG_RE.test(tagName) || /\/>$/.test(token);
+      const isClose = Boolean(closeMatch);
+
+      if (isBlock && isClose) depth = Math.max(0, depth - 1);
+
+      if (isBlock) {
+        lines.push(`${'  '.repeat(depth)}${token.trim()}`);
+      } else if (lines.length === 0) {
+        lines.push(`${'  '.repeat(depth)}${token}`);
+      } else {
+        lines[lines.length - 1] += token;
+      }
+
+      if (isBlock && openMatch && !isClose && !isVoid) depth += 1;
+      continue;
+    }
+
+    const text = token.replace(/^\s+|\s+$/g, (ws) => (ws ? ' ' : ''));
+    if (!text) continue;
+    if (lines.length === 0) {
+      lines.push(`${'  '.repeat(depth)}${text}`);
+    } else {
+      lines[lines.length - 1] += text;
+    }
+  }
+
+  return lines.join('\n');
+}
+
 function wrapEjsDocument(bodyHtml, title) {
   const safeTitle = String(title || 'Template').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const indentedBody = String(bodyHtml || '')
+    .split('\n')
+    .map((line) => (line.length ? `    ${line}` : line))
+    .join('\n');
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>${safeTitle}</title>
   <style>
-    /* Base page chrome; typography/spacing/alignment come from inline styles where DOCX set them. */
-    body {
-      font-family: Arial, Helvetica, sans-serif;
-      font-size: 12pt;
-      color: #111;
-      margin: 24px;
-      line-height: 1.45;
+    /* PDF page box — matches production Board Resolutions chrome. */
+    @page {
+      size: A4;
+      margin: 25mm;
     }
+    body {
+      font-family: "Times New Roman", Times, serif;
+      font-size: 11pt;
+      color: #000;
+      background: #fff;
+      margin: 0;
+      line-height: 1.7;
+    }
+    .page {
+      max-width: 210mm;
+      margin: 0 auto;
+      box-sizing: border-box;
+    }
+    /* HTML preview: mirror @page margin. Print/PDF uses @page only (avoid double inset). */
+    @media screen {
+      body {
+        padding: 25mm;
+      }
+    }
+    @media print {
+      body {
+        padding: 0;
+      }
+    }
+    /* Per-paragraph typography/spacing/alignment still come from DOCX inline styles. */
     p, h1, h2, h3, h4, h5, h6 {
       margin: 0 0 0.25em;
+    }
+    p:empty {
+      min-height: 1em;
     }
     table { border-collapse: collapse; width: 100%; }
     td, th { border: 1px solid #ccc; padding: 4px 8px; vertical-align: top; }
@@ -259,7 +379,9 @@ function wrapEjsDocument(bodyHtml, title) {
   </style>
 </head>
 <body>
-${bodyHtml}
+  <div class="page">
+${indentedBody}
+  </div>
 </body>
 </html>
 `;
@@ -267,7 +389,8 @@ ${bodyHtml}
 
 /**
  * Convert DOCX buffer → EJS HTML. Author markers `{{var}}` become `<%= var %>`.
- * Preserves (best-effort, pure Node): font, size, bold/italic (mammoth), spacing, alignment, indent.
+ * Preserves (best-effort, pure Node): font, size, bold/italic (mammoth), spacing, alignment, indent,
+ * significant spaces/tabs, and empty paragraph gaps. Output body is pretty-printed.
  */
 async function convertDocxBufferToEjs(docxBuffer, options = {}) {
   const paragraphExtras = await extractParagraphExtras(docxBuffer);
@@ -290,7 +413,9 @@ async function convertDocxBufferToEjs(docxBuffer, options = {}) {
   // Pass 2: emit HTML with inline typography / spacing / alignment
   const result = await convertOnce(styleMap);
 
-  const bodyWithEjs = mustacheToEjs(result.value || '');
+  const bodyWithEjs = prettyPrintHtml(
+    preserveSignificantWhitespace(mustacheToEjs(result.value || ''))
+  );
   const names = extractVariableNames(bodyWithEjs);
   const variables = names.map((name) => ({
     name,
@@ -316,4 +441,7 @@ module.exports = {
   twipsToPx,
   normalizeTextAlign,
   extractParagraphExtras,
+  preserveSignificantWhitespace,
+  prettyPrintHtml,
+  encodeTextWhitespace,
 };

@@ -99,8 +99,48 @@
       return `<span class="ejs-var">{{${name}}}</span>`;
     });
     const iframe = document.getElementById('ejsPreview');
+    // Force a document rebuild — identical srcdoc assignments can no-op.
+    iframe.removeAttribute('srcdoc');
     iframe.srcdoc = html;
   }
+
+  const toggleEjsSourceBtn = document.getElementById('toggleEjsSource');
+  const ejsContentEl = document.getElementById('ejsContent');
+  const previewSheet = document.getElementById('previewSheet');
+  const previewPaneTitle = document.getElementById('previewPaneTitle');
+  let ejsSourceOpen = false;
+
+  function setEjsSourceOpen(open) {
+    const next = Boolean(open);
+    const wasOpen = ejsSourceOpen;
+    ejsSourceOpen = next;
+    previewSheet.classList.toggle('is-showing-source', ejsSourceOpen);
+    toggleEjsSourceBtn.setAttribute('aria-pressed', ejsSourceOpen ? 'true' : 'false');
+    toggleEjsSourceBtn.textContent = ejsSourceOpen ? 'Hide EJS' : 'View EJS';
+    toggleEjsSourceBtn.title = ejsSourceOpen
+      ? 'Show rendered template preview'
+      : 'Show EJS source in the A4 preview frame';
+    previewPaneTitle.textContent = ejsSourceOpen ? 'EJS source' : 'Template preview';
+    if (ejsSourceOpen) {
+      ejsContentEl.focus();
+      return;
+    }
+    if (wasOpen) {
+      refreshPreview();
+      toggleEjsSourceBtn.focus();
+    }
+  }
+
+  toggleEjsSourceBtn.addEventListener('click', () => {
+    setEjsSourceOpen(!ejsSourceOpen);
+  });
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && ejsSourceOpen) {
+      e.preventDefault();
+      setEjsSourceOpen(false);
+    }
+  });
 
   async function ensureModels() {
     if (modelsCache.length) return;
@@ -267,6 +307,7 @@
     document.getElementById('draftTitle').textContent = currentDraftName;
     document.getElementById('draftMeta').textContent = `#${data.id} · ${data.status}`;
     document.getElementById('ejsContent').value = data.ejs_content || '';
+    setEjsSourceOpen(false);
     refreshPreview();
 
     variables = Array.isArray(data.variables_json)
@@ -382,7 +423,10 @@
       const { data } = await api(`/api/drafts/${currentDraftId}`, {
         method: 'PATCH',
         headers: headers(),
-        body: JSON.stringify({ variables_json: variables }),
+        body: JSON.stringify({
+          variables_json: variables,
+          ejs_content: document.getElementById('ejsContent').value,
+        }),
       });
       variables = Array.isArray(data.variables_json)
         ? data.variables_json.map((v) => ({

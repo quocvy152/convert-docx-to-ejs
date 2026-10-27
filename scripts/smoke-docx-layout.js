@@ -55,6 +55,16 @@ async function buildStyledDocx() {
         <w:t>Indented italic body</w:t>
       </w:r>
     </w:p>
+    <w:p>
+      <w:pPr>
+        <w:spacing w:before="200" w:after="200"/>
+      </w:pPr>
+    </w:p>
+    <w:p>
+      <w:r>
+        <w:t xml:space="preserve">Name:     padded</w:t>
+      </w:r>
+    </w:p>
     <w:sectPr/>
   </w:body>
 </w:document>`
@@ -70,6 +80,7 @@ async function main() {
     title: 'Style smoke',
   });
 
+  const body = (ejsContent.match(/<body>([\s\S]*)<\/body>/) || [])[1] || '';
   const checks = [
     ['ejs_var', ejsContent.includes('<%= customerName %>')],
     ['var_list', variables.some((v) => v.name === 'customerName')],
@@ -83,6 +94,12 @@ async function main() {
     ['margin_bottom', ejsContent.includes(`margin-bottom: ${expectedAfterPx}px`)],
     ['line_height', /line-height:\s*1\.5/.test(ejsContent)],
     ['layout_rules', layoutRuleCount >= 2],
+    ['nbsp_multi_space', /Name:&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;padded/.test(ejsContent)],
+    ['empty_p_nbsp', /<p[^>]*>&nbsp;<\/p>/.test(ejsContent.replace(/\n\s*/g, ''))],
+    ['pretty_print', (body.match(/\n/g) || []).length >= 3],
+    ['page_at_rule', /@page\s*\{\s*size:\s*A4;\s*margin:\s*25mm;/.test(ejsContent)],
+    ['page_wrapper', /class="page"/.test(ejsContent)],
+    ['screen_padding', /@media screen[\s\S]*padding:\s*25mm/.test(ejsContent)],
   ];
 
   let failed = 0;

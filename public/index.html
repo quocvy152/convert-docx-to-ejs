@@ -148,15 +148,29 @@
 
           <div class="editor-canvas">
             <div class="canvas-head">
-              <h2>EJS preview</h2>
-              <span id="mapStatus" class="map-status" aria-live="polite"></span>
+              <h2 id="previewPaneTitle">Template preview</h2>
+              <div class="canvas-head-actions">
+                <span id="mapStatus" class="map-status" aria-live="polite"></span>
+                <button
+                  type="button"
+                  id="toggleEjsSource"
+                  class="btn btn-secondary btn-sm"
+                  aria-pressed="false"
+                  aria-controls="ejsSourcePanel"
+                  title="Show EJS source in the A4 preview frame"
+                >
+                  View EJS
+                </button>
+              </div>
             </div>
-            <div class="preview-split">
-              <label class="field field-fill" for="ejsContent">
-                <span class="sr-only">EJS content (read-only)</span>
-                <textarea id="ejsContent" spellcheck="false" autocomplete="off" readonly></textarea>
-              </label>
-              <iframe id="ejsPreview" class="ejs-preview" title="Rendered HTML preview" sandbox=""></iframe>
+            <div class="preview-pane">
+              <div class="a4-sheet" id="previewSheet">
+                <iframe id="ejsPreview" class="ejs-preview" title="Rendered HTML preview" sandbox=""></iframe>
+                <label id="ejsSourcePanel" class="ejs-source-panel" for="ejsContent">
+                  <span class="sr-only">EJS content</span>
+                  <textarea id="ejsContent" spellcheck="false" autocomplete="off"></textarea>
+                </label>
+              </div>
             </div>
           </div>
         </div>

@@ -25,7 +25,7 @@
   --pill-negative-ink: #831c1e;
 
   --sidebar-w: 232px;
-  --binding-w: 340px;
+  --binding-w: 380px;
   --topbar-h: 48px;
   --sheet-inset: 8px;
   --radius-sheet: 16px;
@@ -430,6 +430,12 @@ button:disabled {
   background: var(--raised);
 }
 
+.btn-sm {
+  height: 28px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
 .btn-ghost {
   background: transparent;
   border-color: transparent;
@@ -598,7 +604,7 @@ button:disabled {
 
 .canvas-head {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   justify-content: space-between;
   gap: 12px;
   padding: 10px 12px;
@@ -610,6 +616,13 @@ button:disabled {
   margin: 0;
   font-size: 13px;
   font-weight: 600;
+}
+
+.canvas-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
 }
 
 .field-fill {
@@ -1022,48 +1035,88 @@ button:disabled {
   color: var(--danger);
 }
 
-.preview-split {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 10px;
+.preview-pane {
+  display: flex;
+  justify-content: center;
+  align-items: stretch;
   min-height: 0;
   flex: 1;
   height: 100%;
-  padding: 0 10px;
-}
-
-.preview-split .field-fill {
-  min-height: 0;
-  height: 100%;
-}
-
-.preview-split textarea {
-  height: 100%;
-  min-height: 280px;
-  resize: none;
-  font-family: var(--mono);
-  font-size: 12px;
-  line-height: 1.4;
-  background: #0f1419;
-  color: #e8eef5;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-card);
   padding: 12px;
+  overflow: auto;
+  background: var(--raised);
 }
 
-.ejs-preview {
-  width: 100%;
-  min-height: 280px;
+/* Single A4 frame shared by render preview and EJS source.
+   Stack both layers — never display:none the iframe (browsers drop srcdoc). */
+.a4-sheet {
+  position: relative;
+  width: 210mm;
+  max-width: 100%;
   height: 100%;
+  min-height: 0;
+  background: #fff;
   border: 1px solid var(--border);
   border-radius: var(--radius-card);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.ejs-preview,
+.ejs-source-panel {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: none;
+  margin: 0;
   background: #fff;
 }
 
-@media (max-width: 1100px) {
-  .preview-split {
-    grid-template-columns: 1fr;
-  }
+.ejs-preview {
+  z-index: 1;
+  visibility: visible;
+}
+
+.ejs-source-panel {
+  z-index: 0;
+  display: flex;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.a4-sheet.is-showing-source .ejs-preview {
+  z-index: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.a4-sheet.is-showing-source .ejs-source-panel {
+  z-index: 1;
+  visibility: visible;
+  pointer-events: auto;
+}
+
+.ejs-source-panel textarea {
+  flex: 1;
+  width: 100%;
+  min-height: 0;
+  height: 100%;
+  resize: none;
+  border: none;
+  border-radius: 0;
+  padding: 14px 16px;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.5;
+  tab-size: 2;
+  background: #0f1419;
+  color: #e8eef5;
+}
+
+.ejs-source-panel textarea:focus {
+  outline: none;
+  box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--accent) 45%, transparent);
 }
 
 @media (max-width: 520px) {
