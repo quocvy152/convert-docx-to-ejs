@@ -3,8 +3,10 @@
 const fs = require('fs');
 const path = require('path');
 const config = require('../config');
-const { getAllowedModel } = require('../config/modelAllowlist');
-const { resolveDraftStore } = require('../db/draftRepository');
+const {
+  normalizeVariables,
+  assertFullyMapped,
+} = require('./pathMappingService');
 
 function slugify(name) {
   return (
@@ -16,46 +18,18 @@ function slugify(name) {
   );
 }
 
-function normalizeVariables(variablesJson) {
-  if (!Array.isArray(variablesJson)) return [];
-  return variablesJson.map((v) => ({
-    name: v.name,
-    model: v.model || null,
-    field: v.field || null,
-  }));
-}
-
-function assertFullyMapped(variables) {
-  if (!variables.length) {
-    return; // no placeholders — allow export of static EJS
-  }
-  const missing = variables.filter((v) => !v.model || !v.field);
-  if (missing.length) {
-    const err = new Error(
-      `Map all variables before export. Unmapped: ${missing.map((v) => v.name).join(', ')}`
-    );
-    err.status = 400;
-    err.unmapped = missing.map((v) => v.name);
-    throw err;
-  }
-  for (const v of variables) {
-    if (!getAllowedModel(v.model)) {
-      const err = new Error(`Variable "${v.name}" mapped to non-allowlisted model: ${v.model}`);
-      err.status = 400;
-      throw err;
-    }
-  }
-}
-
 /**
  * Write EJS file only (no FileTemplate / process_step binding).
+ * Accepts a client-supplied draft payload — server does not load/persist drafts.
  */
-async function exportDraftEjs(draftId) {
-  const store = await resolveDraftStore();
-  const draft = await store.findActiveById(draftId);
-  if (!draft) {
-    const err = new Error('Draft not found');
-    err.status = 404;
+async function exportDraftEjs(draftInput) {
+  const draft =
+    draftInput && typeof draftInput === 'object' && !Array.isArray(draftInput)
+      ? draftInput
+      : null;
+  if (!draft || draft.ejs_content == null) {
+    const err = new Error('Draft payload with ejs_content is required');
+    err.status = 400;
     throw err;
   }
 
@@ -74,18 +48,19 @@ async function exportDraftEjs(draftId) {
   fs.writeFileSync(absoluteEjsPath, draft.ejs_content, 'utf8');
 
   const relativePath = `${config.pathTemplatePrefix.replace(/\/$/, '')}/${fileName}`;
-
-  draft.status = 'exported';
-  draft.published_path_template = relativePath;
-  draft.updated_time = new Date();
-  await draft.save();
+  const exported = {
+    ...draft,
+    status: 'exported',
+    published_path_template: relativePath,
+    updated_time: new Date().toISOString(),
+  };
 
   return {
     absoluteEjsPath,
     pathTemplate: relativePath,
     fileName,
     variables,
-    draft,
+    draft: exported,
   };
 }
 

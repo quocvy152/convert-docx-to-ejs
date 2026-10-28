@@ -1,7 +1,11 @@
 'use strict';
 
 const { sequelize } = require('../db/models');
-const { listAllowedModels, getAllowedModel } = require('../config/modelAllowlist');
+const {
+  listAllowedModels,
+  getAllowedModel,
+  listAssociationsForModel,
+} = require('../config/modelAllowlist');
 
 async function tableExists(tableName) {
   const [rows] = await sequelize.query(
@@ -24,17 +28,19 @@ async function resolveTableName(model) {
 
 async function listModels() {
   const models = listAllowedModels();
-  const out = [];
-  for (const m of models) {
-    const full = getAllowedModel(m.name);
-    const resolved = await resolveTableName(full);
-    out.push({
-      name: m.name,
-      table: resolved || m.table,
-      available: Boolean(resolved),
-    });
-  }
-  return out;
+  // Resolve in parallel — sequential INFORMATION_SCHEMA round-trips to remote
+  // MySQL made the first catalog call after DOCX convert slow/flaky in the UI.
+  return Promise.all(
+    models.map(async (m) => {
+      const full = getAllowedModel(m.name);
+      const resolved = await resolveTableName(full);
+      return {
+        name: m.name,
+        table: resolved || m.table,
+        available: Boolean(resolved),
+      };
+    })
+  );
 }
 
 async function listFieldsForModel(modelName) {
@@ -74,7 +80,33 @@ async function listFieldsForModel(modelName) {
   };
 }
 
+async function listAssociations(modelName) {
+  const model = getAllowedModel(modelName);
+  if (!model) {
+    const err = new Error(`Model not in allowlist: ${modelName}`);
+    err.status = 400;
+    throw err;
+  }
+
+  const associations = listAssociationsForModel(modelName) || [];
+  return Promise.all(
+    associations.map(async (a) => {
+      const related = getAllowedModel(a.model);
+      const resolved = related ? await resolveTableName(related) : null;
+      return {
+        name: a.name,
+        model: a.model,
+        available: Boolean(resolved),
+      };
+    })
+  ).then((rows) => ({
+    model: model.name,
+    associations: rows,
+  }));
+}
+
 module.exports = {
   listModels,
   listFieldsForModel,
+  listAssociations,
 };

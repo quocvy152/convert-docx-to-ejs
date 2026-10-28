@@ -216,6 +216,18 @@ function createStylePreservingOptions(paragraphExtras) {
   };
 }
 
+const COLLECTION_MARKER_TEXT_RE = /^\{\{#\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}$/;
+const COLLECTION_FIELD_RE = /\{\{\s*(\.|item|[a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}/g;
+const LEFTOVER_COLLECTION_MARKER_RE = /\{\{#\s*[a-zA-Z_][a-zA-Z0-9_]*\s*\}\}/;
+
+function stripHtmlToText(html) {
+  return String(html || '')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function extractVariableNames(html) {
   const names = new Set();
   const text = String(html || '');
@@ -231,6 +243,147 @@ function extractVariableNames(html) {
 
 function mustacheToEjs(html) {
   return String(html || '').replace(MUSTACHE_RE, (_full, name) => `<%= ${name} %>`);
+}
+
+/**
+ * Table-first arrays: paragraph `{{#collection}}` immediately above a <table>
+ * with exactly one sample data row of {{field}} markers.
+ * Markers in that row become item.* only (no globals in loop scope).
+ */
+function transformCollectionTable(tableHtml, collectionName) {
+  const trMatches = [...String(tableHtml).matchAll(/<tr\b[\s\S]*?<\/tr>/gi)];
+  const rowsWithMarkers = trMatches.filter((tr) => /\{\{/.test(tr[0]));
+
+  if (!rowsWithMarkers.length) {
+    return {
+      error: `Collection "{{#${collectionName}}}" table has no {{field}} markers in a row`,
+    };
+  }
+  if (rowsWithMarkers.length > 1) {
+    return {
+      error: `Collection "{{#${collectionName}}}" must have exactly one sample data row (found ${rowsWithMarkers.length})`,
+    };
+  }
+
+  const sampleRow = rowsWithMarkers[0][0];
+  /** @type {string[]} */
+  const itemFields = [];
+  let hasStringItem = false;
+  let hasObjectField = false;
+
+  const convertedRow = sampleRow.replace(COLLECTION_FIELD_RE, (_full, field) => {
+    if (field === '.' || field === 'item') {
+      hasStringItem = true;
+      return '<%= item %>';
+    }
+    hasObjectField = true;
+    itemFields.push(field);
+    return `<%= item.${field} %>`;
+  });
+
+  if (/\{\{/.test(convertedRow)) {
+    return {
+      error: `Collection "{{#${collectionName}}}" sample row has invalid markers (only {{field}}, {{item}}, or {{.}} allowed)`,
+    };
+  }
+  if (hasStringItem && hasObjectField) {
+    return {
+      error: `Collection "{{#${collectionName}}}" cannot mix {{.}}/{{item}} with object fields`,
+    };
+  }
+
+  const loopOpen = `<% (${collectionName} || []).forEach(function (item) { %>`;
+  const loopClose = '<% }) %>';
+  const transformedTable = String(tableHtml).replace(
+    sampleRow,
+    `${loopOpen}${convertedRow}${loopClose}`
+  );
+
+  return {
+    transformedTable,
+    itemFields: [...new Set(itemFields)],
+    itemKind: hasStringItem ? 'string' : 'object',
+  };
+}
+
+function transformCollectionTables(html) {
+  /** @type {{ name: string, itemFields: string[], itemKind: 'object'|'string' }[]} */
+  const collections = [];
+  /** @type {string[]} */
+  const errors = [];
+
+  // pInner must not cross </p> (non-greedy [\s\S]*? still backtracks across paragraphs
+  // until </p> immediately before <table>, swallowing earlier paragraphs).
+  const re = /<p(\s[^>]*)?>((?:(?!<\/p>)[\s\S])*)<\/p>\s*(<table\b[\s\S]*?<\/table>)/gi;
+  const out = String(html || '').replace(re, (full, _pAttrs, pInner, tableHtml) => {
+    const text = stripHtmlToText(pInner);
+    const marker = text.match(COLLECTION_MARKER_TEXT_RE);
+    if (!marker) return full;
+
+    const collectionName = marker[1];
+    if (collections.some((c) => c.name === collectionName)) {
+      errors.push(`Duplicate collection marker "{{#${collectionName}}}"`);
+      return full;
+    }
+
+    const result = transformCollectionTable(tableHtml, collectionName);
+    if (result.error) {
+      errors.push(result.error);
+      return full;
+    }
+
+    collections.push({
+      name: collectionName,
+      itemFields: result.itemFields,
+      itemKind: result.itemKind,
+    });
+    return result.transformedTable;
+  });
+
+  if (LEFTOVER_COLLECTION_MARKER_RE.test(out)) {
+    errors.push(
+      'Collection marker {{#name}} must be a paragraph immediately above a table (and only that marker in the paragraph)'
+    );
+  }
+
+  if (errors.length) {
+    const err = new Error(errors.join('; '));
+    err.status = 400;
+    throw err;
+  }
+
+  return { html: out, collections };
+}
+
+function buildVariablesFromHtml(html, collections) {
+  const scalarNames = extractVariableNames(html).filter((n) => n !== 'item');
+  const collectionNames = new Set((collections || []).map((c) => c.name));
+
+  const scalars = scalarNames
+    .filter((name) => !collectionNames.has(name))
+    .map((name) => ({
+      name,
+      kind: 'scalar',
+      model: null,
+      field: null,
+    }));
+
+  const collectionVars = (collections || []).map((c) => ({
+    name: c.name,
+    kind: 'collection',
+    itemKind: c.itemKind,
+    model: null,
+    field: null,
+    itemFields:
+      c.itemKind === 'string'
+        ? []
+        : c.itemFields.map((fieldName) => ({
+            name: fieldName,
+            field: null,
+          })),
+  }));
+
+  return [...scalars, ...collectionVars];
 }
 
 /**
@@ -388,7 +541,10 @@ ${indentedBody}
 }
 
 /**
- * Convert DOCX buffer → EJS HTML. Author markers `{{var}}` become `<%= var %>`.
+ * Convert DOCX buffer → EJS HTML.
+ * - `{{var}}` → `<%= var %>`
+ * - Paragraph `{{#collection}}` immediately above a table → forEach over one sample row
+ *   (`<%= item.field %>` / `<%= item %>`); globals forbidden inside that row.
  * Preserves (best-effort, pure Node): font, size, bold/italic (mammoth), spacing, alignment, indent,
  * significant spaces/tabs, and empty paragraph gaps. Output body is pretty-printed.
  */
@@ -413,15 +569,11 @@ async function convertDocxBufferToEjs(docxBuffer, options = {}) {
   // Pass 2: emit HTML with inline typography / spacing / alignment
   const result = await convertOnce(styleMap);
 
+  const { html: withCollections, collections } = transformCollectionTables(result.value || '');
   const bodyWithEjs = prettyPrintHtml(
-    preserveSignificantWhitespace(mustacheToEjs(result.value || ''))
+    preserveSignificantWhitespace(mustacheToEjs(withCollections))
   );
-  const names = extractVariableNames(bodyWithEjs);
-  const variables = names.map((name) => ({
-    name,
-    model: null,
-    field: null,
-  }));
+  const variables = buildVariablesFromHtml(bodyWithEjs, collections);
   const ejsContent = wrapEjsDocument(bodyWithEjs, options.title);
 
   return {
@@ -436,6 +588,9 @@ module.exports = {
   convertDocxBufferToEjs,
   mustacheToEjs,
   extractVariableNames,
+  transformCollectionTables,
+  transformCollectionTable,
+  buildVariablesFromHtml,
   paragraphLayoutCss,
   runTypographyCss,
   twipsToPx,

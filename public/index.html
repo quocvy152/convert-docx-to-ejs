@@ -98,6 +98,14 @@
             </svg>
           </button>
         </div>
+        <div id="folderGate" class="folder-gate">
+          <p class="folder-hint">
+            Drafts are saved to <code>Documents/convert-ejs-tool</code> on this PC.
+            Allow access when prompted (folder is fixed — you only confirm permission).
+          </p>
+          <button type="button" id="connectFolder" class="btn btn-secondary btn-block">Allow local drafts</button>
+          <p id="folderStatus" class="folder-status" role="status" aria-live="polite" hidden></p>
+        </div>
         <ul id="draftList" class="draft-list" aria-label="Draft list"></ul>
         <p id="draftEmpty" class="empty-hint" hidden>No drafts yet. Upload a DOCX to start.</p>
       </section>
@@ -123,7 +131,7 @@
         <svg width="28" height="28" viewBox="0 0 24 24" fill="none" aria-hidden="true">
           <path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/>
         </svg>
-        <p>Upload a DOCX with <code>{{variable}}</code> markers, map each variable to a Model field, then export EJS.</p>
+        <p>Upload a DOCX with <code>{{variable}}</code> markers (tables: paragraph <code>{{#collection}}</code> above the table), map each via Direct field or a relation path (hops + filters), then export EJS.</p>
       </div>
 
       <section id="editorSection" class="editor" hidden>
@@ -131,7 +139,7 @@
           <aside class="binding-rail" aria-label="Variable mapping">
             <div class="rail-head">
               <h2>Variable mapping</h2>
-              <p class="rail-sub">Map each <code>&lt;%= name %&gt;</code> to a CRM Model + field. Export is blocked until all are mapped.</p>
+              <p class="rail-sub">Map via relation path (hops + filters) or Direct field. Collections need a path ending in an association (+ item fields). Export blocked until all mapped.</p>
             </div>
 
             <div class="rail-block">
@@ -178,6 +186,8 @@
     </main>
   </div>
 
+  <script src="/localDraftStore.js"></script>
+  <script src="/pathMapping.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

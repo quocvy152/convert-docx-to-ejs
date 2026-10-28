@@ -1,43 +1,36 @@
 'use strict';
 
-const fs = require('fs');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const { Op } = require('sequelize');
-const config = require('../config');
 const { resolveDraftStore } = require('../db/draftRepository');
 const { convertDocxBufferToEjs } = require('./docxToEjs');
 
-function ensureDirs() {
-  fs.mkdirSync(config.uploadsDir, { recursive: true });
-}
-
+/**
+ * Convert DOCX → draft payload in memory. Does not persist on the server;
+ * the client writes the JSON under Documents/convert-ejs-tool.
+ */
 async function createDraftFromDocx({ file, name, description, createdBy }) {
-  ensureDirs();
   const id = uuidv4();
-  const docxPath = path.join(config.uploadsDir, `${id}.docx`);
-  fs.writeFileSync(docxPath, file.buffer);
-
   const { ejsContent, variables } = await convertDocxBufferToEjs(file.buffer, {
     title: name || file.originalname || 'Untitled template',
   });
 
-  const store = await resolveDraftStore();
-  const draft = await store.create({
+  const now = new Date().toISOString();
+  return {
     id,
     name: name || path.parse(file.originalname || 'template').name,
     description: description || '',
     status: 'draft',
-    // Reuse column for source path (DOCX); name kept for schema compatibility
-    original_pdf_path: docxPath,
+    original_pdf_path: null,
     ejs_content: ejsContent,
     variables_json: variables,
     process_step_ids_json: [],
     created_by: createdBy || null,
     is_deleted: false,
-  });
-
-  return draft;
+    created_time: now,
+    updated_time: now,
+  };
 }
 
 async function listDrafts() {

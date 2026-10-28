@@ -1,18 +1,96 @@
 (() => {
   let currentDraftId = null;
   let currentDraftName = '';
-  /** @type {{ name: string, model: string|null, field: string|null }[]} */
+  /** @type {FileSystemDirectoryHandle|null} */
+  let draftsDirHandle = null;
+  const PM = window.PathMapping;
+  /** @type {ReturnType<typeof PM.normalizeVariable>[]} */
   let variables = [];
   /** @type {{ name: string, table: string, available: boolean }[]} */
   let modelsCache = [];
-  /** @type {Record<string, { name: string }[]>} */
+  /** @type {Promise<void>|null} */
+  let modelsLoadPromise = null;
+  /** @type {Record<string, { name: string, dataType?: string }[]>} */
   let fieldsCache = {};
+  /** @type {Record<string, { name: string, model: string, available: boolean }[]>} */
+  let associationsCache = {};
+  /** @type {{ op: string, label: string, needsValue: boolean }[]} */
+  let filterOpsCache = PM.FILTER_OPS_FALLBACK.slice();
+  /** @type {{ id: string, label: string, kind: string, rootModel: string, hops: unknown[], leaf: unknown }[]} */
+  let recipesCache = [];
+  let recipesLoadPromise = null;
+
+  function normalizeVariable(v) {
+    return PM.normalizeVariable(v);
+  }
+
+  function isVariableMapped(v) {
+    return PM.isVariableMapped(v, filterOpsCache);
+  }
 
   const API_KEY_STORAGE = 'templateBuilder.apiKey';
+  const store = window.LocalDraftStore;
 
   const apiKeyInput = document.getElementById('apiKey');
   const savedKey = sessionStorage.getItem(API_KEY_STORAGE);
   if (savedKey) apiKeyInput.value = savedKey;
+
+  function setFolderStatus(state, message) {
+    const gate = document.getElementById('folderGate');
+    const el = document.getElementById('folderStatus');
+    const connected = Boolean(draftsDirHandle);
+    gate.classList.toggle('is-connected', connected);
+    if (!message) {
+      el.hidden = !connected;
+      el.textContent = connected ? `Saving to ${store.FOLDER_NAME}` : '';
+      el.classList.toggle('is-ok', connected);
+      el.classList.remove('is-error');
+      return;
+    }
+    el.hidden = false;
+    el.textContent = message;
+    el.classList.toggle('is-ok', state === 'ok');
+    el.classList.toggle('is-error', state === 'error');
+  }
+
+  async function requireDraftsFolder() {
+    if (!store || !store.isSupported()) {
+      const err = new Error('Use Chrome or Edge to save drafts on this PC');
+      err.code = 'FS_UNSUPPORTED';
+      throw err;
+    }
+    if (draftsDirHandle && (await store.ensurePermission(draftsDirHandle))) {
+      return draftsDirHandle;
+    }
+    // User gesture path: permission only when handle exists; first time confirms Documents.
+    draftsDirHandle = await store.ensureAccess();
+    setFolderStatus('ok', `Saving to Documents/${store.FOLDER_NAME}`);
+    return draftsDirHandle;
+  }
+
+  async function allowLocalDrafts() {
+    const btn = document.getElementById('connectFolder');
+    setBusy(btn, true);
+    try {
+      if (!store || !store.isSupported()) {
+        throw Object.assign(new Error('Use Chrome or Edge to save drafts on this PC'), {
+          code: 'FS_UNSUPPORTED',
+        });
+      }
+      draftsDirHandle = await store.ensureAccess();
+      setFolderStatus('ok', `Saving to Documents/${store.FOLDER_NAME}`);
+      await refreshDrafts();
+    } catch (err) {
+      if (err.code === 'FS_CANCELLED' || (err && err.name === 'AbortError')) {
+        setFolderStatus('error', 'Permission cancelled');
+        return;
+      }
+      setFolderStatus('error', err.message || 'Could not get folder permission');
+      showError(err);
+    } finally {
+      setBusy(btn, false);
+    }
+  }
 
   function currentApiKey() {
     return apiKeyInput.value
@@ -64,7 +142,40 @@
   }
 
   function unmappedNames() {
-    return variables.filter((v) => !v.model || !v.field).map((v) => v.name);
+    return PM.unmappedNames(variables, filterOpsCache);
+  }
+
+  async function ensureMappingMeta() {
+    await ensureModels();
+    if (!recipesLoadPromise) {
+      recipesLoadPromise = (async () => {
+        try {
+          const [opsRes, recipesRes] = await Promise.all([
+            api('/api/catalog/filter-operators', { headers: headers(false) }),
+            api('/api/catalog/path-recipes', { headers: headers(false) }),
+          ]);
+          if (Array.isArray(opsRes.data) && opsRes.data.length) {
+            filterOpsCache = opsRes.data;
+          }
+          recipesCache = Array.isArray(recipesRes.data) ? recipesRes.data : [];
+        } catch (_err) {
+          /* keep fallbacks */
+        }
+      })();
+    }
+    await recipesLoadPromise;
+  }
+
+  async function modelAfterHops(rootModel, hops) {
+    let current = rootModel;
+    for (const hop of hops || []) {
+      if (!hop.association || !current) return null;
+      const assocs = await loadAssociations(current);
+      const a = assocs.find((x) => x.name === hop.association);
+      if (!a) return null;
+      current = a.model;
+    }
+    return current;
   }
 
   function updateMapStatus() {
@@ -93,11 +204,13 @@
 
   function refreshPreview() {
     const raw = document.getElementById('ejsContent').value || '';
-    // Preview: strip EJS tags to placeholders so iframe shows structure
-    const html = raw.replace(/<%[=-]?\s*([\s\S]*?)%>/g, (_m, expr) => {
-      const name = String(expr).trim();
-      return `<span class="ejs-var">{{${name}}}</span>`;
-    });
+    // Preview: drop control tags; show output expressions as placeholders
+    const html = raw
+      .replace(/<%(?![=-])[\s\S]*?%>/g, '')
+      .replace(/<%[=-]\s*([\s\S]*?)%>/g, (_m, expr) => {
+        const name = String(expr).trim();
+        return `<span class="ejs-var">{{${name}}}</span>`;
+      });
     const iframe = document.getElementById('ejsPreview');
     // Force a document rebuild — identical srcdoc assignments can no-op.
     iframe.removeAttribute('srcdoc');
@@ -142,10 +255,37 @@
     }
   });
 
+  async function fetchModelsOnce() {
+    const { data } = await api('/api/catalog/models', { headers: headers(false) });
+    modelsCache = Array.isArray(data) ? data : [];
+  }
+
+  /**
+   * Load CRM model allowlist once. Prefetch on auth so the first post-upload
+   * openDraft does not race a cold catalog call against a busy/remote DB.
+   * Dedupes in-flight callers and retries once on transient failure.
+   */
   async function ensureModels() {
     if (modelsCache.length) return;
-    const { data } = await api('/api/catalog/models', { headers: headers(false) });
-    modelsCache = data || [];
+    if (modelsLoadPromise) return modelsLoadPromise;
+
+    modelsLoadPromise = (async () => {
+      try {
+        await fetchModelsOnce();
+      } catch (firstErr) {
+        // One retry — remote MySQL / idle pool drops show up as a one-shot 500 here.
+        await new Promise((r) => setTimeout(r, 400));
+        try {
+          await fetchModelsOnce();
+        } catch (_retryErr) {
+          throw firstErr;
+        }
+      } finally {
+        modelsLoadPromise = null;
+      }
+    })();
+
+    return modelsLoadPromise;
   }
 
   async function loadFields(modelName) {
@@ -158,84 +298,40 @@
     return fieldsCache[modelName];
   }
 
-  function renderVariableList() {
-    const list = document.getElementById('variableList');
-    const empty = document.getElementById('variableEmpty');
-    list.innerHTML = '';
-    empty.hidden = variables.length > 0;
+  async function loadAssociations(modelName) {
+    if (!modelName) return [];
+    if (associationsCache[modelName]) return associationsCache[modelName];
+    const { data } = await api(
+      `/api/catalog/models/${encodeURIComponent(modelName)}/associations`,
+      { headers: headers(false) }
+    );
+    associationsCache[modelName] = (data && data.associations) || [];
+    return associationsCache[modelName];
+  }
 
-    variables.forEach((v, index) => {
-      const li = document.createElement('li');
-      li.className = 'var-map-item' + (v.model && v.field ? ' is-mapped' : ' is-unmapped');
-
-      const nameEl = document.createElement('div');
-      nameEl.className = 'var-map-name';
-      nameEl.innerHTML = `<code></code>`;
-      nameEl.querySelector('code').textContent = `<%= ${v.name} %>`;
-
-      const modelLabel = document.createElement('label');
-      modelLabel.className = 'field';
-      modelLabel.innerHTML = `<span>Model</span>`;
-      const modelSelect = document.createElement('select');
-      modelSelect.dataset.index = String(index);
-      modelSelect.dataset.role = 'model';
-      const opt0 = document.createElement('option');
-      opt0.value = '';
-      opt0.textContent = 'Select model…';
-      modelSelect.appendChild(opt0);
-      modelsCache.forEach((m) => {
-        const opt = document.createElement('option');
-        opt.value = m.name;
-        opt.textContent = m.available ? m.name : `${m.name} (table missing)`;
-        opt.disabled = !m.available;
-        if (v.model === m.name) opt.selected = true;
-        modelSelect.appendChild(opt);
-      });
-      modelLabel.appendChild(modelSelect);
-
-      const fieldLabel = document.createElement('label');
-      fieldLabel.className = 'field';
-      fieldLabel.innerHTML = `<span>Field</span>`;
-      const fieldSelect = document.createElement('select');
-      fieldSelect.dataset.index = String(index);
-      fieldSelect.dataset.role = 'field';
-      fieldSelect.disabled = !v.model;
-      const f0 = document.createElement('option');
-      f0.value = '';
-      f0.textContent = v.model ? 'Select field…' : 'Select model first';
-      fieldSelect.appendChild(f0);
-      fieldLabel.appendChild(fieldSelect);
-
-      modelSelect.addEventListener('change', async () => {
-        const i = Number(modelSelect.dataset.index);
-        variables[i].model = modelSelect.value || null;
-        variables[i].field = null;
-        try {
-          await populateFields(fieldSelect, variables[i].model, null);
-          updateMapStatus();
-        } catch (err) {
-          showError(err);
-        }
-      });
-
-      fieldSelect.addEventListener('change', () => {
-        const i = Number(fieldSelect.dataset.index);
-        variables[i].field = fieldSelect.value || null;
-        li.classList.toggle('is-mapped', Boolean(variables[i].model && variables[i].field));
-        li.classList.toggle('is-unmapped', !(variables[i].model && variables[i].field));
-        updateMapStatus();
-      });
-
-      li.appendChild(nameEl);
-      li.appendChild(modelLabel);
-      li.appendChild(fieldLabel);
-      list.appendChild(li);
-
-      if (v.model) {
-        populateFields(fieldSelect, v.model, v.field).catch(showError);
-      }
+  function appendModelOptions(selectEl, selectedModel) {
+    const opt0 = document.createElement('option');
+    opt0.value = '';
+    opt0.textContent = 'Select model…';
+    selectEl.appendChild(opt0);
+    modelsCache.forEach((m) => {
+      const opt = document.createElement('option');
+      opt.value = m.name;
+      opt.textContent = m.available ? m.name : `${m.name} (table missing)`;
+      opt.disabled = !m.available;
+      if (selectedModel === m.name) opt.selected = true;
+      selectEl.appendChild(opt);
     });
+  }
 
+  function touchVar(index, li) {
+    variables[index] = PM.syncMirrors(variables[index]);
+    if (li) {
+      li.classList.toggle('is-mapped', isVariableMapped(variables[index]));
+      li.classList.toggle('is-unmapped', !isVariableMapped(variables[index]));
+      const sum = li.querySelector('.path-summary');
+      if (sum) sum.textContent = PM.pathSummary(variables[index]);
+    }
     updateMapStatus();
   }
 
@@ -263,11 +359,429 @@
     selectEl.disabled = false;
   }
 
+  async function populateAssociations(selectEl, modelName, selectedAssoc) {
+    selectEl.innerHTML = '';
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+    if (!modelName) {
+      placeholder.textContent = 'Select model first';
+      selectEl.appendChild(placeholder);
+      selectEl.disabled = true;
+      return;
+    }
+    placeholder.textContent = 'Select association…';
+    selectEl.appendChild(placeholder);
+    selectEl.disabled = true;
+    const associations = await loadAssociations(modelName);
+    if (!associations.length) {
+      placeholder.textContent = 'No associations on this model';
+      selectEl.disabled = true;
+      return;
+    }
+    associations.forEach((a) => {
+      const opt = document.createElement('option');
+      opt.value = a.name;
+      opt.textContent = a.available ? `${a.name} → ${a.model}` : `${a.name} → ${a.model} (missing)`;
+      opt.disabled = !a.available;
+      if (selectedAssoc === a.name) opt.selected = true;
+      selectEl.appendChild(opt);
+    });
+    selectEl.disabled = false;
+  }
+
+  function renderVariableList() {
+    const list = document.getElementById('variableList');
+    const empty = document.getElementById('variableEmpty');
+    list.innerHTML = '';
+    empty.hidden = variables.length > 0;
+
+    variables.forEach((raw, index) => {
+      variables[index] = normalizeVariable(raw);
+      const v = variables[index];
+      const li = document.createElement('li');
+      li.className =
+        'var-map-item' + (isVariableMapped(v) ? ' is-mapped' : ' is-unmapped');
+      if (v.kind === 'collection') li.classList.add('is-collection');
+
+      const nameEl = document.createElement('div');
+      nameEl.className = 'var-map-name';
+      const code = document.createElement('code');
+      code.textContent =
+        v.kind === 'collection' ? `{{#${v.name}}}` : `<%= ${v.name} %>`;
+      nameEl.appendChild(code);
+      if (v.kind === 'collection') {
+        const badge = document.createElement('span');
+        badge.className = 'var-kind-badge';
+        badge.textContent = v.itemKind === 'string' ? 'array' : 'collection';
+        nameEl.appendChild(badge);
+      }
+      li.appendChild(nameEl);
+
+      const summary = document.createElement('p');
+      summary.className = 'path-summary';
+      summary.textContent = PM.pathSummary(v);
+      summary.title = summary.textContent;
+      li.appendChild(summary);
+
+      const kindRecipes = recipesCache.filter((r) => r.kind === v.kind);
+      if (kindRecipes.length) {
+        const recipeLab = document.createElement('label');
+        recipeLab.className = 'field';
+        recipeLab.innerHTML = '<span>Recipe</span>';
+        const recipeSel = document.createElement('select');
+        const r0 = document.createElement('option');
+        r0.value = '';
+        r0.textContent = 'Apply recipe…';
+        recipeSel.appendChild(r0);
+        kindRecipes.forEach((r) => {
+          const opt = document.createElement('option');
+          opt.value = r.id;
+          opt.textContent = r.label;
+          recipeSel.appendChild(opt);
+        });
+        recipeSel.addEventListener('change', () => {
+          const recipe = kindRecipes.find((r) => r.id === recipeSel.value);
+          if (!recipe) return;
+          variables[index] = PM.applyRecipe(variables[index], recipe);
+          renderVariableList();
+        });
+        recipeLab.appendChild(recipeSel);
+        li.appendChild(recipeLab);
+      }
+
+      const directMode = v.kind === 'scalar' && PM.isDirectMode(v);
+      if (v.kind === 'scalar') {
+        const modeRow = document.createElement('div');
+        modeRow.className = 'segmented path-mode';
+        modeRow.setAttribute('role', 'group');
+        modeRow.setAttribute('aria-label', 'Mapping mode');
+        const mkBtn = (label, active, onClick) => {
+          const b = document.createElement('button');
+          b.type = 'button';
+          b.className = 'segment' + (active ? ' is-active' : '');
+          b.textContent = label;
+          b.addEventListener('click', onClick);
+          return b;
+        };
+        modeRow.appendChild(
+          mkBtn('Direct field', directMode, () => {
+            variables[index] = PM.setDirectField(
+              variables[index],
+              variables[index].rootModel,
+              variables[index].leaf && variables[index].leaf.field
+            );
+            variables[index].hops = [];
+            renderVariableList();
+          })
+        );
+        modeRow.appendChild(
+          mkBtn('Relation path', !directMode, () => {
+            if (!variables[index].hops.length) {
+              variables[index].hops = [PM.emptyHop()];
+            }
+            PM.syncMirrors(variables[index]);
+            renderVariableList();
+          })
+        );
+        li.appendChild(modeRow);
+      }
+
+      const rootLab = document.createElement('label');
+      rootLab.className = 'field';
+      rootLab.innerHTML = '<span>Root model</span>';
+      const rootSel = document.createElement('select');
+      appendModelOptions(rootSel, v.rootModel);
+      rootSel.addEventListener('change', () => {
+        variables[index].rootModel = rootSel.value || null;
+        variables[index].hops = v.kind === 'collection' || !directMode ? [] : [];
+        if (v.kind === 'scalar') {
+          if (!directMode) variables[index].hops = [PM.emptyHop()];
+          variables[index].leaf = { field: null };
+        } else {
+          variables[index].hops = [PM.emptyHop()];
+          (variables[index].itemFields || []).forEach((f) => {
+            f.field = null;
+          });
+        }
+        PM.syncMirrors(variables[index]);
+        renderVariableList();
+      });
+      rootLab.appendChild(rootSel);
+      li.appendChild(rootLab);
+
+      const editor = document.createElement('div');
+      editor.className = 'path-editor';
+      li.appendChild(editor);
+
+      (async () => {
+        try {
+          if (v.kind === 'scalar' && directMode) {
+            const fieldLab = document.createElement('label');
+            fieldLab.className = 'field';
+            fieldLab.innerHTML = '<span>Field</span>';
+            const fieldSel = document.createElement('select');
+            fieldLab.appendChild(fieldSel);
+            editor.appendChild(fieldLab);
+            await populateFields(fieldSel, v.rootModel, v.leaf && v.leaf.field);
+            fieldSel.addEventListener('change', () => {
+              variables[index].leaf = { field: fieldSel.value || null };
+              variables[index].hops = [];
+              touchVar(index, li);
+            });
+            return;
+          }
+
+          // Relation path hops
+          let fromModel = v.rootModel;
+          for (let hi = 0; hi < v.hops.length; hi += 1) {
+            const hop = v.hops[hi];
+            const hopEl = document.createElement('div');
+            hopEl.className = 'path-hop';
+            const hopHead = document.createElement('div');
+            hopHead.className = 'path-hop-head';
+            hopHead.innerHTML = `<span class="path-hop-label">Hop ${hi + 1}</span>`;
+            const removeHop = document.createElement('button');
+            removeHop.type = 'button';
+            removeHop.className = 'btn btn-ghost btn-sm';
+            removeHop.textContent = 'Remove';
+            removeHop.disabled = v.kind === 'collection' && v.hops.length === 1;
+            removeHop.addEventListener('click', () => {
+              variables[index].hops.splice(hi, 1);
+              if (v.kind === 'scalar' && !variables[index].hops.length) {
+                /* stay in path mode with empty hop */
+                variables[index].hops = [PM.emptyHop()];
+              }
+              if (variables[index].itemFields) {
+                variables[index].itemFields.forEach((f) => {
+                  f.field = null;
+                });
+              }
+              if (variables[index].leaf) variables[index].leaf.field = null;
+              PM.syncMirrors(variables[index]);
+              renderVariableList();
+            });
+            hopHead.appendChild(removeHop);
+            hopEl.appendChild(hopHead);
+
+            const assocLab = document.createElement('label');
+            assocLab.className = 'field';
+            assocLab.innerHTML = '<span>Association</span>';
+            const assocSel = document.createElement('select');
+            assocLab.appendChild(assocSel);
+            hopEl.appendChild(assocLab);
+            await populateAssociations(assocSel, fromModel, hop.association);
+
+            const hopFrom = fromModel;
+            assocSel.addEventListener('change', async () => {
+              variables[index].hops[hi].association = assocSel.value || '';
+              variables[index].hops = variables[index].hops.slice(0, hi + 1);
+              if (variables[index].itemFields) {
+                variables[index].itemFields.forEach((f) => {
+                  f.field = null;
+                });
+              }
+              if (variables[index].leaf) variables[index].leaf.field = null;
+              PM.syncMirrors(variables[index]);
+              renderVariableList();
+            });
+
+            const filtersBox = document.createElement('div');
+            filtersBox.className = 'path-filters';
+            const filtersHead = document.createElement('div');
+            filtersHead.className = 'path-filters-head';
+            filtersHead.innerHTML = '<span>Filters (AND)</span>';
+            const addFilterBtn = document.createElement('button');
+            addFilterBtn.type = 'button';
+            addFilterBtn.className = 'btn btn-ghost btn-sm';
+            addFilterBtn.textContent = '+ Filter';
+            addFilterBtn.addEventListener('click', () => {
+              if (!variables[index].hops[hi].filters) {
+                variables[index].hops[hi].filters = [];
+              }
+              variables[index].hops[hi].filters.push(PM.emptyFilter());
+              renderVariableList();
+            });
+            filtersHead.appendChild(addFilterBtn);
+            filtersBox.appendChild(filtersHead);
+
+            const filterFields = hop.association
+              ? await loadFields(
+                  (
+                    await loadAssociations(hopFrom)
+                  ).find((a) => a.name === hop.association)?.model || hopFrom
+                )
+              : hopFrom
+                ? await loadFields(hopFrom)
+                : [];
+            // Filters apply on the related model of this hop (after join)
+            const filterModelName = hop.association
+              ? (await loadAssociations(hopFrom)).find((a) => a.name === hop.association)
+                  ?.model
+              : null;
+            const cols = filterModelName ? await loadFields(filterModelName) : filterFields;
+
+            (hop.filters || []).forEach((filt, fi) => {
+              const row = document.createElement('div');
+              row.className = 'path-filter-row';
+              const colSel = document.createElement('select');
+              colSel.setAttribute('aria-label', 'Filter column');
+              const c0 = document.createElement('option');
+              c0.value = '';
+              c0.textContent = 'Column…';
+              colSel.appendChild(c0);
+              cols.forEach((c) => {
+                const o = document.createElement('option');
+                o.value = c.name;
+                o.textContent = c.name;
+                if (filt.column === c.name) o.selected = true;
+                colSel.appendChild(o);
+              });
+              const opSel = document.createElement('select');
+              opSel.setAttribute('aria-label', 'Filter operator');
+              filterOpsCache.forEach((op) => {
+                const o = document.createElement('option');
+                o.value = op.op;
+                o.textContent = op.label;
+                if (filt.op === op.op) o.selected = true;
+                opSel.appendChild(o);
+              });
+              const valInput = document.createElement('input');
+              valInput.type = 'text';
+              valInput.placeholder = 'Value';
+              valInput.value = filt.value || '';
+              valInput.disabled = !PM.opNeedsValue(filt.op, filterOpsCache);
+              const rm = document.createElement('button');
+              rm.type = 'button';
+              rm.className = 'btn btn-ghost btn-sm';
+              rm.textContent = '×';
+              rm.setAttribute('aria-label', 'Remove filter');
+              const commitFilter = () => {
+                variables[index].hops[hi].filters[fi] = {
+                  column: colSel.value,
+                  op: opSel.value,
+                  value: valInput.value,
+                };
+                valInput.disabled = !PM.opNeedsValue(opSel.value, filterOpsCache);
+                touchVar(index, li);
+              };
+              colSel.addEventListener('change', commitFilter);
+              opSel.addEventListener('change', commitFilter);
+              valInput.addEventListener('change', commitFilter);
+              valInput.addEventListener('input', () => {
+                variables[index].hops[hi].filters[fi].value = valInput.value;
+                touchVar(index, li);
+              });
+              rm.addEventListener('click', () => {
+                variables[index].hops[hi].filters.splice(fi, 1);
+                renderVariableList();
+              });
+              row.appendChild(colSel);
+              row.appendChild(opSel);
+              row.appendChild(valInput);
+              row.appendChild(rm);
+              filtersBox.appendChild(row);
+            });
+            hopEl.appendChild(filtersBox);
+            editor.appendChild(hopEl);
+
+            if (hop.association) {
+              const next = (await loadAssociations(fromModel)).find(
+                (a) => a.name === hop.association
+              );
+              fromModel = next ? next.model : null;
+            } else {
+              fromModel = null;
+            }
+          }
+
+          const addHopBtn = document.createElement('button');
+          addHopBtn.type = 'button';
+          addHopBtn.className = 'btn btn-secondary btn-sm path-add-hop';
+          addHopBtn.textContent = '+ Hop';
+          addHopBtn.disabled = !fromModel;
+          addHopBtn.addEventListener('click', () => {
+            variables[index].hops.push(PM.emptyHop());
+            if (variables[index].leaf) variables[index].leaf.field = null;
+            if (variables[index].itemFields) {
+              variables[index].itemFields.forEach((f) => {
+                f.field = null;
+              });
+            }
+            PM.syncMirrors(variables[index]);
+            renderVariableList();
+          });
+          editor.appendChild(addHopBtn);
+
+          if (v.kind === 'scalar') {
+            const leafLab = document.createElement('label');
+            leafLab.className = 'field';
+            leafLab.innerHTML = '<span>Leaf field</span>';
+            const leafSel = document.createElement('select');
+            leafLab.appendChild(leafSel);
+            editor.appendChild(leafLab);
+            await populateFields(leafSel, fromModel, v.leaf && v.leaf.field);
+            leafSel.addEventListener('change', () => {
+              variables[index].leaf = { field: leafSel.value || null };
+              touchVar(index, li);
+            });
+          } else if (v.itemKind !== 'string' && (v.itemFields || []).length) {
+            const itemFieldsList = document.createElement('ul');
+            itemFieldsList.className = 'var-item-fields';
+            for (let fi = 0; fi < v.itemFields.length; fi += 1) {
+              const f = v.itemFields[fi];
+              const row = document.createElement('li');
+              row.className = 'var-item-field';
+              const lab = document.createElement('label');
+              lab.className = 'field';
+              const span = document.createElement('span');
+              const c = document.createElement('code');
+              c.textContent = f.name;
+              span.appendChild(c);
+              lab.appendChild(span);
+              const sel = document.createElement('select');
+              lab.appendChild(sel);
+              row.appendChild(lab);
+              itemFieldsList.appendChild(row);
+              await populateFields(sel, fromModel, f.field);
+              sel.addEventListener('change', () => {
+                variables[index].itemFields[fi].field = sel.value || null;
+                touchVar(index, li);
+              });
+            }
+            editor.appendChild(itemFieldsList);
+          }
+
+          touchVar(index, li);
+        } catch (err) {
+          showError(err);
+        }
+      })();
+
+      list.appendChild(li);
+    });
+
+    updateMapStatus();
+  }
+
   async function refreshDrafts() {
-    const { data } = await api('/api/drafts', { headers: headers(false) });
     const list = document.getElementById('draftList');
     const empty = document.getElementById('draftEmpty');
     list.innerHTML = '';
+
+    let data = [];
+    try {
+      const dir = await requireDraftsFolder();
+      data = await store.listDrafts(dir);
+    } catch (err) {
+      empty.hidden = false;
+      empty.textContent =
+        err.code === 'FS_UNSUPPORTED'
+          ? 'Local drafts need Chrome or Edge.'
+          : 'Allow access to Documents/convert-ejs-tool to see drafts.';
+      throw err;
+    }
+
+    empty.textContent = 'No drafts yet. Upload a DOCX to start.';
     empty.hidden = data.length > 0;
 
     data.forEach((d) => {
@@ -298,24 +812,26 @@
   }
 
   async function openDraft(id) {
-    const { data } = await api(`/api/drafts/${id}`, { headers: headers(false) });
+    const dir = await requireDraftsFolder();
+    const data = await store.readDraft(dir, id);
+    if (!data) {
+      const err = new Error('Draft not found in local folder');
+      err.status = 404;
+      throw err;
+    }
     currentDraftId = data.id;
     currentDraftName = data.name || `Draft #${data.id}`;
     syncEditorVisibility();
     markActiveDraft(data.id);
 
     document.getElementById('draftTitle').textContent = currentDraftName;
-    document.getElementById('draftMeta').textContent = `#${data.id} · ${data.status}`;
+    document.getElementById('draftMeta').textContent = `${data.id} · ${data.status}`;
     document.getElementById('ejsContent').value = data.ejs_content || '';
     setEjsSourceOpen(false);
     refreshPreview();
 
     variables = Array.isArray(data.variables_json)
-      ? data.variables_json.map((v) => ({
-          name: v.name,
-          model: v.model || null,
-          field: v.field || null,
-        }))
+      ? data.variables_json.map(normalizeVariable)
       : [];
 
     clearStatus();
@@ -323,7 +839,7 @@
     document.getElementById('result').classList.remove('is-error');
 
     try {
-      await ensureModels();
+      await ensureMappingMeta();
       renderVariableList();
     } catch (err) {
       showError(err);
@@ -368,11 +884,22 @@
     setBusy(btn, true);
     setAuthStatus(null, '');
     try {
-      await refreshDrafts();
+      // Auth check via model catalog (drafts are local-only).
+      await ensureModels();
       clearStatus();
       document.getElementById('result').textContent = '';
       document.getElementById('result').classList.remove('is-error');
       setAuthStatus('ok', 'Connected');
+      const peeked = store && store.isSupported() ? await store.peekAccess() : null;
+      if (peeked) {
+        draftsDirHandle = peeked;
+        setFolderStatus('ok', `Saving to Documents/${store.FOLDER_NAME}`);
+        await refreshDrafts();
+      } else if (!store || !store.isSupported()) {
+        setFolderStatus('error', 'Use Chrome or Edge for local drafts');
+      } else {
+        setFolderStatus(null, '');
+      }
     } catch (err) {
       const isAuth = err.status === 401 || /unauthorized|invalid auth/i.test(String(err.message || ''));
       setAuthStatus('error', isAuth ? 'Invalid Key' : 'Request failed');
@@ -381,6 +908,10 @@
       setBusy(btn, false);
     }
   }
+
+  document.getElementById('connectFolder').addEventListener('click', () => {
+    allowLocalDrafts();
+  });
 
   document.getElementById('refreshDrafts').addEventListener('click', () => {
     refreshDrafts().catch(showError);
@@ -398,6 +929,7 @@
     const fd = new FormData(form);
     setBusy(submitBtn, true);
     try {
+      const dir = await requireDraftsFolder();
       const res = await fetch('/api/drafts/upload', {
         method: 'POST',
         headers: { 'X-Template-Builder-Key': currentApiKey() },
@@ -405,9 +937,14 @@
       });
       const body = await res.json();
       if (!res.ok) throw new Error(body.error || res.statusText);
+      const saved = await store.writeDraft(dir, body.data);
       form.reset();
       await refreshDrafts();
-      await openDraft(body.data.id);
+      await openDraft(saved.id);
+      const banner = document.getElementById('statusBanner');
+      banner.hidden = false;
+      banner.classList.add('is-ok');
+      banner.textContent = `Draft saved to ${store.FOLDER_NAME}`;
     } catch (err) {
       showError(err);
     } finally {
@@ -420,36 +957,34 @@
     const btn = document.getElementById('saveDraft');
     setBusy(btn, true);
     try {
-      const { data } = await api(`/api/drafts/${currentDraftId}`, {
-        method: 'PATCH',
-        headers: headers(),
-        body: JSON.stringify({
-          variables_json: variables,
-          ejs_content: document.getElementById('ejsContent').value,
-        }),
+      const dir = await requireDraftsFolder();
+      const existing = (await store.readDraft(dir, currentDraftId)) || { id: currentDraftId };
+      const data = await store.writeDraft(dir, {
+        ...existing,
+        id: currentDraftId,
+        name: currentDraftName || existing.name,
+        status: existing.status === 'exported' ? 'draft' : existing.status || 'draft',
+        variables_json: variables,
+        ejs_content: document.getElementById('ejsContent').value,
       });
       variables = Array.isArray(data.variables_json)
-        ? data.variables_json.map((v) => ({
-            name: v.name,
-            model: v.model || null,
-            field: v.field || null,
-          }))
+        ? data.variables_json.map(normalizeVariable)
         : variables;
       const out = document.getElementById('result');
       out.classList.remove('is-error');
       out.textContent = JSON.stringify(
-        { id: data.id, status: data.status, variables: data.variables_json },
+        { id: data.id, status: data.status, variables: data.variables_json, saved: 'local' },
         null,
         2
       );
-      document.getElementById('draftMeta').textContent = `#${data.id} · ${data.status}`;
+      document.getElementById('draftMeta').textContent = `${data.id} · ${data.status}`;
       await refreshDrafts();
       markActiveDraft(currentDraftId);
       updateMapStatus();
       const banner = document.getElementById('statusBanner');
       banner.hidden = false;
       banner.classList.add('is-ok');
-      banner.textContent = 'Mapping saved';
+      banner.textContent = 'Mapping saved locally';
     } catch (err) {
       showError(err);
     } finally {
@@ -467,23 +1002,38 @@
     const btn = document.getElementById('exportEjs');
     setBusy(btn, true);
     try {
-      // Persist mapping first
-      await api(`/api/drafts/${currentDraftId}`, {
-        method: 'PATCH',
-        headers: headers(),
-        body: JSON.stringify({ variables_json: variables }),
+      const dir = await requireDraftsFolder();
+      const existing = (await store.readDraft(dir, currentDraftId)) || { id: currentDraftId };
+      const ejsContent = document.getElementById('ejsContent').value;
+      const localDraft = await store.writeDraft(dir, {
+        ...existing,
+        id: currentDraftId,
+        name: currentDraftName || existing.name,
+        variables_json: variables,
+        ejs_content: ejsContent,
       });
+
       const { data } = await api(`/api/drafts/${currentDraftId}/export-ejs`, {
         method: 'POST',
         headers: headers(),
-        body: JSON.stringify({}),
+        body: JSON.stringify({
+          id: localDraft.id,
+          name: localDraft.name,
+          ejs_content: localDraft.ejs_content,
+          variables_json: localDraft.variables_json,
+          description: localDraft.description,
+        }),
       });
+
+      if (data.draft) {
+        await store.writeDraft(dir, { ...localDraft, ...data.draft });
+      }
 
       const fileName = data.file_name || `${currentDraftName || 'template'}.ejs`;
       const content =
         data.ejs_content != null
           ? data.ejs_content
-          : document.getElementById('ejsContent').value;
+          : ejsContent;
       downloadTextFile(fileName, content);
 
       const out = document.getElementById('result');
@@ -494,6 +1044,7 @@
           path_template: data.path_template,
           absolute_ejs_path: data.absolute_ejs_path,
           downloaded: true,
+          saved: 'local',
         },
         null,
         2
@@ -537,7 +1088,25 @@
   }
 
   syncEditorVisibility();
-  if (apiKeyInput.value.trim()) {
-    submitApiKey();
-  }
+
+  (async () => {
+    if (store && store.isSupported()) {
+      try {
+        const handle = await store.peekAccess();
+        if (handle) {
+          draftsDirHandle = handle;
+          setFolderStatus('ok', `Saving to Documents/${store.FOLDER_NAME}`);
+        } else {
+          setFolderStatus(null, '');
+        }
+      } catch (_err) {
+        setFolderStatus(null, '');
+      }
+    } else {
+      setFolderStatus('error', 'Use Chrome or Edge for local drafts');
+    }
+    if (apiKeyInput.value.trim()) {
+      submitApiKey();
+    }
+  })();
 })();
