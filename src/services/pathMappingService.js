@@ -1,6 +1,6 @@
 'use strict';
 
-const { getAllowedModel, getAssociation } = require('../config/modelAllowlist');
+const { getAllowedModel, legacyRelatedModel } = require('../config/modelAllowlist');
 const { getFilterOperator, operatorNeedsValue } = require('../config/filterOperators');
 
 function emptyFilter() {
@@ -24,17 +24,98 @@ function normalizeFilter(f) {
   };
 }
 
-function normalizeHop(h) {
-  if (!h || typeof h !== 'object') {
-    return { association: '', filters: [] };
+function emptyHop() {
+  return { relatedModel: '', filters: [] };
+}
+
+/**
+ * Resolve hop target model. Prefers relatedModel; migrates legacy association names.
+ */
+function hopRelatedModel(fromModel, hop) {
+  if (!hop || typeof hop !== 'object') return '';
+  if (typeof hop.relatedModel === 'string' && hop.relatedModel.trim()) {
+    return hop.relatedModel.trim();
   }
+  const assoc = typeof hop.association === 'string' ? hop.association.trim() : '';
+  if (!assoc) return '';
+  if (getAllowedModel(assoc)) return assoc;
+  return legacyRelatedModel(fromModel, assoc) || '';
+}
+
+function normalizeHop(h, fromModel) {
+  if (!h || typeof h !== 'object') return emptyHop();
   const filters = Array.isArray(h.filters)
     ? h.filters.map(normalizeFilter).filter((f) => Boolean(f.column))
     : [];
   return {
-    association: typeof h.association === 'string' ? h.association.trim() : '',
+    relatedModel: hopRelatedModel(fromModel, h),
     filters,
   };
+}
+
+/**
+ * Normalize stored valueSourceHop. null = default (last hop / root if no hops).
+ * Invalid non-integers become NaN so validation can reject them.
+ */
+function normalizeValueSourceHop(raw) {
+  if (raw === null || raw === undefined || raw === '') return null;
+  const n = typeof raw === 'number' ? raw : Number(raw);
+  if (!Number.isInteger(n)) return NaN;
+  return n;
+}
+
+/**
+ * Effective hop index for value fields. -1 = rootModel.
+ * Returns null when an explicit valueSourceHop is out of range / invalid.
+ */
+function effectiveValueSourceHop(v) {
+  const hops = v && Array.isArray(v.hops) ? v.hops : [];
+  const raw = v ? v.valueSourceHop : null;
+  if (raw === null || raw === undefined || raw === '') {
+    return hops.length === 0 ? -1 : hops.length - 1;
+  }
+  const n = typeof raw === 'number' ? raw : Number(raw);
+  if (!Number.isInteger(n) || n < -1 || n >= hops.length) return null;
+  return n;
+}
+
+function isValueSourceHopValid(v) {
+  if (!v) return false;
+  if (v.valueSourceHop === null || v.valueSourceHop === undefined || v.valueSourceHop === '') {
+    return true;
+  }
+  return effectiveValueSourceHop(v) !== null;
+}
+
+/** Model name at valueSourceHop (-1 = root). */
+function modelAtValueSource(rootModel, hops, valueSourceHop) {
+  if (valueSourceHop === -1) return rootModel || null;
+  const list = Array.isArray(hops) ? hops : [];
+  if (!Number.isInteger(valueSourceHop) || valueSourceHop < 0 || valueSourceHop >= list.length) {
+    return null;
+  }
+  return list[valueSourceHop].relatedModel || null;
+}
+
+/**
+ * Clamp explicit valueSourceHop into [-1, last]. Clears nothing — caller clears fields.
+ * Omits / null stay null (default semantics).
+ */
+function clampValueSourceHop(v) {
+  if (!v || typeof v !== 'object') return v;
+  if (v.valueSourceHop === null || v.valueSourceHop === undefined || v.valueSourceHop === '') {
+    v.valueSourceHop = null;
+    return v;
+  }
+  const hops = Array.isArray(v.hops) ? v.hops : [];
+  const max = hops.length === 0 ? -1 : hops.length - 1;
+  const n = typeof v.valueSourceHop === 'number' ? v.valueSourceHop : Number(v.valueSourceHop);
+  if (!Number.isInteger(n) || n < -1 || n > max) {
+    v.valueSourceHop = max;
+  } else {
+    v.valueSourceHop = n;
+  }
+  return v;
 }
 
 /**
@@ -47,6 +128,7 @@ function normalizeVariable(v) {
       kind: 'scalar',
       rootModel: null,
       hops: [],
+      valueSourceHop: null,
       leaf: { field: null },
       model: null,
       field: null,
@@ -57,18 +139,18 @@ function normalizeVariable(v) {
   const name = v.name || '';
 
   let rootModel = v.rootModel || v.model || null;
-  let hops = Array.isArray(v.hops) ? v.hops.map(normalizeHop) : null;
+  let rawHops = Array.isArray(v.hops) ? v.hops : null;
   let leaf =
     v.leaf && typeof v.leaf === 'object'
       ? { field: v.leaf.field || null }
       : null;
 
   // Legacy → path
-  if (!hops) {
-    hops = [];
+  if (!rawHops) {
+    rawHops = [];
     if (kind === 'collection') {
       if (v.field) {
-        hops = [{ association: v.field, filters: [] }];
+        rawHops = [{ relatedModel: String(v.field), filters: [] }];
       }
       leaf = null;
     } else {
@@ -81,6 +163,15 @@ function normalizeVariable(v) {
   }
   if (kind === 'collection') {
     leaf = null;
+  }
+
+  /** @type {{ relatedModel: string, filters: ReturnType<typeof normalizeFilter>[] }[]} */
+  const hops = [];
+  let from = rootModel;
+  for (const raw of rawHops) {
+    const hop = normalizeHop(raw, from);
+    hops.push(hop);
+    from = hop.relatedModel || null;
   }
 
   const itemFields =
@@ -96,17 +187,20 @@ function normalizeVariable(v) {
   const legacyField =
     kind === 'collection'
       ? hops.length
-        ? hops[hops.length - 1].association || null
+        ? hops[hops.length - 1].relatedModel || null
         : null
       : hops.length === 0
         ? leaf && leaf.field
         : leaf && leaf.field;
+
+  const valueSourceHop = normalizeValueSourceHop(v.valueSourceHop);
 
   const out = {
     name,
     kind,
     rootModel: rootModel || null,
     hops,
+    valueSourceHop: Number.isNaN(valueSourceHop) ? v.valueSourceHop : valueSourceHop,
     leaf: kind === 'scalar' ? leaf || { field: null } : null,
     model: rootModel || null,
     field: legacyField || null,
@@ -126,25 +220,25 @@ function normalizeVariables(variablesJson) {
 }
 
 function resolveHopModels(rootModel, hops) {
-  /** @type {{ from: string, association: string, to: string }[]} */
+  /** @type {{ from: string, relatedModel: string, to: string }[]} */
   const steps = [];
   let current = rootModel;
   for (let i = 0; i < hops.length; i += 1) {
     const hop = hops[i];
-    if (!hop.association) {
-      return { ok: false, error: `Hop ${i + 1} missing association`, steps, leafModel: current };
+    const related = hopRelatedModel(current, hop);
+    if (!related) {
+      return { ok: false, error: `Hop ${i + 1} missing related model`, steps, leafModel: current };
     }
-    const assoc = getAssociation(current, hop.association);
-    if (!assoc) {
+    if (!getAllowedModel(related)) {
       return {
         ok: false,
-        error: `Unknown association "${hop.association}" on ${current}`,
+        error: `Unknown related model "${related}" on ${current}`,
         steps,
         leafModel: current,
       };
     }
-    steps.push({ from: current, association: hop.association, to: assoc.model });
-    current = assoc.model;
+    steps.push({ from: current, relatedModel: related, to: related });
+    current = related;
   }
   return { ok: true, error: null, steps, leafModel: current };
 }
@@ -159,11 +253,11 @@ function filterIsComplete(f) {
 function isVariableMapped(v) {
   const n = normalizeVariable(v);
   if (!n.rootModel || !getAllowedModel(n.rootModel)) return false;
+  if (!isValueSourceHopValid(n)) return false;
 
   for (const hop of n.hops) {
-    if (!hop.association) return false;
+    if (!hop.relatedModel) return false;
     for (const f of hop.filters || []) {
-      // Allow empty filter rows only if none partially filled — require all listed filters complete
       if (!filterIsComplete(f)) return false;
     }
   }
@@ -194,13 +288,14 @@ function unmappedReasons(v) {
   }
   for (let i = 0; i < n.hops.length; i += 1) {
     const hop = n.hops[i];
-    if (!hop.association) missing.push(`${n.name}.hop${i + 1}`);
+    if (!hop.relatedModel) missing.push(`${n.name}.hop${i + 1}`);
     (hop.filters || []).forEach((f, fi) => {
       if (!filterIsComplete(f)) missing.push(`${n.name}.hop${i + 1}.filter${fi + 1}`);
     });
   }
   const resolved = resolveHopModels(n.rootModel, n.hops);
   if (!resolved.ok) missing.push(n.name);
+  if (!isValueSourceHopValid(n)) missing.push(`${n.name}.valueSourceHop`);
 
   if (n.kind === 'collection') {
     if (!n.hops.length) missing.push(n.name);
@@ -241,9 +336,13 @@ function assertFullyMapped(variables) {
       throw err;
     }
 
+    if (!isValueSourceHopValid(v)) {
+      missing.push(`${v.name}.valueSourceHop`);
+      continue;
+    }
+
     for (let i = 0; i < v.hops.length; i += 1) {
       const hop = v.hops[i];
-      const fromModel = i === 0 ? v.rootModel : resolved.steps[i - 1].to;
       for (const f of hop.filters || []) {
         if (!filterIsComplete(f)) {
           missing.push(`${v.name}.hop${i + 1}.filter`);
@@ -254,8 +353,6 @@ function assertFullyMapped(variables) {
           err.status = 400;
           throw err;
         }
-        // Column existence is UI-assisted; export only requires non-empty column + valid op.
-        void fromModel;
       }
     }
 
@@ -289,10 +386,17 @@ module.exports = {
   normalizeVariable,
   normalizeVariables,
   resolveHopModels,
+  hopRelatedModel,
+  effectiveValueSourceHop,
+  modelAtValueSource,
+  isValueSourceHopValid,
+  clampValueSourceHop,
+  normalizeValueSourceHop,
   isVariableMapped,
   unmappedReasons,
   assertFullyMapped,
   filterIsComplete,
   normalizeFilter,
   normalizeHop,
+  emptyHop,
 };

@@ -4,7 +4,7 @@ Standalone MVP for CRM template configuration:
 
 1. Permissioned user uploads a **DOCX** (author places `{{variable}}` markers; for tables, a paragraph `{{#collection}}` immediately above the table with one sample data row)  
 2. System converts to EJS (`{{x}}` → `<%= x %>`; collections → `forEach` over the sample row as `item.*`)  
-3. User maps scalars → Model + field; collections → Model + association (+ item fields)  
+3. User maps scalars → Model + field; collections → Model + related model path (+ item fields)  
 4. **Export EJS** writes the `.ejs` file (blocked until all variables are mapped)
 
 Binding to `file_template` / `process_step` is **out of scope** for this slice (see `docs/ideas/docx-to-ejs-one-screen.md`).
@@ -69,6 +69,7 @@ X-Template-Builder-Key: <key from TEMPLATE_BUILDER_API_KEYS>
 | POST | `/api/drafts/:id/export-ejs` | body: `name`, `ejs_content`, `variables_json` → write `.ejs` if all mapped |
 | GET | `/api/catalog/models` | allowlisted CRM models (+ table availability) |
 | GET | `/api/catalog/models/:name/fields` | columns for a model |
+| GET | `/api/catalog/models/:name/related-models` | related models via MySQL FK (both directions) |
 | GET | `/health` | app + DB ping |
 
 Draft list/get/patch on the server return **410** — drafts live on the client under `Documents/convert-ejs-tool` (File System Access API; Chrome/Edge). Connect the folder once in the UI; JSON files are written locally on upload/save.
@@ -80,7 +81,7 @@ Draft list/get/patch on the server return **410** — drafts live on the client 
 - Writes `.ejs` under `EJS_OUTPUT_DIR` (server) and also downloads to the browser; client updates local JSON status to `exported`
 - Does **not** create/update `file_template` or `process_step_has_file_template` (later phase)
 
-Model allowlist and table name mapping live in `src/config/modelAllowlist.js` (with alternate table name fallbacks).
+Model allowlist and table name mapping live in `src/config/modelAllowlist.js` (with alternate table name fallbacks). Relation hops are discovered from MySQL foreign keys, not hardcoded associations.
 
 ## Safety
 

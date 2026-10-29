@@ -12,13 +12,12 @@
   let modelsLoadPromise = null;
   /** @type {Record<string, { name: string, dataType?: string }[]>} */
   let fieldsCache = {};
-  /** @type {Record<string, { name: string, model: string, available: boolean }[]>} */
-  let associationsCache = {};
+  /** @type {Record<string, { name: string, table?: string, available: boolean }[]>} */
+  let relatedModelsCache = {};
   /** @type {{ op: string, label: string, needsValue: boolean }[]} */
   let filterOpsCache = PM.FILTER_OPS_FALLBACK.slice();
-  /** @type {{ id: string, label: string, kind: string, rootModel: string, hops: unknown[], leaf: unknown }[]} */
-  let recipesCache = [];
-  let recipesLoadPromise = null;
+  /** @type {Promise<void>|null} */
+  let filterOpsLoadPromise = null;
 
   function normalizeVariable(v) {
     return PM.normalizeVariable(v);
@@ -147,33 +146,28 @@
 
   async function ensureMappingMeta() {
     await ensureModels();
-    if (!recipesLoadPromise) {
-      recipesLoadPromise = (async () => {
+    if (!filterOpsLoadPromise) {
+      filterOpsLoadPromise = (async () => {
         try {
-          const [opsRes, recipesRes] = await Promise.all([
-            api('/api/catalog/filter-operators', { headers: headers(false) }),
-            api('/api/catalog/path-recipes', { headers: headers(false) }),
-          ]);
+          const opsRes = await api('/api/catalog/filter-operators', {
+            headers: headers(false),
+          });
           if (Array.isArray(opsRes.data) && opsRes.data.length) {
             filterOpsCache = opsRes.data;
           }
-          recipesCache = Array.isArray(recipesRes.data) ? recipesRes.data : [];
         } catch (_err) {
           /* keep fallbacks */
         }
       })();
     }
-    await recipesLoadPromise;
+    await filterOpsLoadPromise;
   }
 
   async function modelAfterHops(rootModel, hops) {
     let current = rootModel;
     for (const hop of hops || []) {
-      if (!hop.association || !current) return null;
-      const assocs = await loadAssociations(current);
-      const a = assocs.find((x) => x.name === hop.association);
-      if (!a) return null;
-      current = a.model;
+      if (!hop.relatedModel || !current) return null;
+      current = hop.relatedModel;
     }
     return current;
   }
@@ -298,15 +292,15 @@
     return fieldsCache[modelName];
   }
 
-  async function loadAssociations(modelName) {
+  async function loadRelatedModels(modelName) {
     if (!modelName) return [];
-    if (associationsCache[modelName]) return associationsCache[modelName];
+    if (relatedModelsCache[modelName]) return relatedModelsCache[modelName];
     const { data } = await api(
-      `/api/catalog/models/${encodeURIComponent(modelName)}/associations`,
+      `/api/catalog/models/${encodeURIComponent(modelName)}/related-models`,
       { headers: headers(false) }
     );
-    associationsCache[modelName] = (data && data.associations) || [];
-    return associationsCache[modelName];
+    relatedModelsCache[modelName] = (data && data.relatedModels) || [];
+    return relatedModelsCache[modelName];
   }
 
   function appendModelOptions(selectEl, selectedModel) {
@@ -359,7 +353,7 @@
     selectEl.disabled = false;
   }
 
-  async function populateAssociations(selectEl, modelName, selectedAssoc) {
+  async function populateRelatedModels(selectEl, modelName, selectedModel) {
     selectEl.innerHTML = '';
     const placeholder = document.createElement('option');
     placeholder.value = '';
@@ -369,21 +363,21 @@
       selectEl.disabled = true;
       return;
     }
-    placeholder.textContent = 'Select association…';
+    placeholder.textContent = 'Select related model…';
     selectEl.appendChild(placeholder);
     selectEl.disabled = true;
-    const associations = await loadAssociations(modelName);
-    if (!associations.length) {
-      placeholder.textContent = 'No associations on this model';
+    const related = await loadRelatedModels(modelName);
+    if (!related.length) {
+      placeholder.textContent = 'No related models (FK) found';
       selectEl.disabled = true;
       return;
     }
-    associations.forEach((a) => {
+    related.forEach((m) => {
       const opt = document.createElement('option');
-      opt.value = a.name;
-      opt.textContent = a.available ? `${a.name} → ${a.model}` : `${a.name} → ${a.model} (missing)`;
-      opt.disabled = !a.available;
-      if (selectedAssoc === a.name) opt.selected = true;
+      opt.value = m.name;
+      opt.textContent = m.available ? m.name : `${m.name} (missing)`;
+      opt.disabled = !m.available;
+      if (selectedModel === m.name) opt.selected = true;
       selectEl.appendChild(opt);
     });
     selectEl.disabled = false;
@@ -422,32 +416,6 @@
       summary.textContent = PM.pathSummary(v);
       summary.title = summary.textContent;
       li.appendChild(summary);
-
-      const kindRecipes = recipesCache.filter((r) => r.kind === v.kind);
-      if (kindRecipes.length) {
-        const recipeLab = document.createElement('label');
-        recipeLab.className = 'field';
-        recipeLab.innerHTML = '<span>Recipe</span>';
-        const recipeSel = document.createElement('select');
-        const r0 = document.createElement('option');
-        r0.value = '';
-        r0.textContent = 'Apply recipe…';
-        recipeSel.appendChild(r0);
-        kindRecipes.forEach((r) => {
-          const opt = document.createElement('option');
-          opt.value = r.id;
-          opt.textContent = r.label;
-          recipeSel.appendChild(opt);
-        });
-        recipeSel.addEventListener('change', () => {
-          const recipe = kindRecipes.find((r) => r.id === recipeSel.value);
-          if (!recipe) return;
-          variables[index] = PM.applyRecipe(variables[index], recipe);
-          renderVariableList();
-        });
-        recipeLab.appendChild(recipeSel);
-        li.appendChild(recipeLab);
-      }
 
       const directMode = v.kind === 'scalar' && PM.isDirectMode(v);
       if (v.kind === 'scalar') {
@@ -494,6 +462,7 @@
       rootSel.addEventListener('change', () => {
         variables[index].rootModel = rootSel.value || null;
         variables[index].hops = v.kind === 'collection' || !directMode ? [] : [];
+        variables[index].valueSourceHop = null;
         if (v.kind === 'scalar') {
           if (!directMode) variables[index].hops = [PM.emptyHop()];
           variables[index].leaf = { field: null };
@@ -551,36 +520,27 @@
                 /* stay in path mode with empty hop */
                 variables[index].hops = [PM.emptyHop()];
               }
-              if (variables[index].itemFields) {
-                variables[index].itemFields.forEach((f) => {
-                  f.field = null;
-                });
-              }
-              if (variables[index].leaf) variables[index].leaf.field = null;
+              PM.clampValueSourceHop(variables[index]);
+              PM.clearValueFields(variables[index]);
               PM.syncMirrors(variables[index]);
               renderVariableList();
             });
             hopHead.appendChild(removeHop);
             hopEl.appendChild(hopHead);
 
-            const assocLab = document.createElement('label');
-            assocLab.className = 'field';
-            assocLab.innerHTML = '<span>Association</span>';
-            const assocSel = document.createElement('select');
-            assocLab.appendChild(assocSel);
-            hopEl.appendChild(assocLab);
-            await populateAssociations(assocSel, fromModel, hop.association);
+            const relatedLab = document.createElement('label');
+            relatedLab.className = 'field';
+            relatedLab.innerHTML = '<span>Related model</span>';
+            const relatedSel = document.createElement('select');
+            relatedLab.appendChild(relatedSel);
+            hopEl.appendChild(relatedLab);
+            await populateRelatedModels(relatedSel, fromModel, hop.relatedModel);
 
-            const hopFrom = fromModel;
-            assocSel.addEventListener('change', async () => {
-              variables[index].hops[hi].association = assocSel.value || '';
+            relatedSel.addEventListener('change', async () => {
+              variables[index].hops[hi].relatedModel = relatedSel.value || '';
               variables[index].hops = variables[index].hops.slice(0, hi + 1);
-              if (variables[index].itemFields) {
-                variables[index].itemFields.forEach((f) => {
-                  f.field = null;
-                });
-              }
-              if (variables[index].leaf) variables[index].leaf.field = null;
+              PM.clampValueSourceHop(variables[index]);
+              PM.clearValueFields(variables[index]);
               PM.syncMirrors(variables[index]);
               renderVariableList();
             });
@@ -604,21 +564,13 @@
             filtersHead.appendChild(addFilterBtn);
             filtersBox.appendChild(filtersHead);
 
-            const filterFields = hop.association
-              ? await loadFields(
-                  (
-                    await loadAssociations(hopFrom)
-                  ).find((a) => a.name === hop.association)?.model || hopFrom
-                )
-              : hopFrom
-                ? await loadFields(hopFrom)
+            // Filters apply on the related model of this hop
+            const filterModelName = hop.relatedModel || null;
+            const cols = filterModelName
+              ? await loadFields(filterModelName)
+              : fromModel
+                ? await loadFields(fromModel)
                 : [];
-            // Filters apply on the related model of this hop (after join)
-            const filterModelName = hop.association
-              ? (await loadAssociations(hopFrom)).find((a) => a.name === hop.association)
-                  ?.model
-              : null;
-            const cols = filterModelName ? await loadFields(filterModelName) : filterFields;
 
             (hop.filters || []).forEach((filt, fi) => {
               const row = document.createElement('div');
@@ -684,14 +636,7 @@
             hopEl.appendChild(filtersBox);
             editor.appendChild(hopEl);
 
-            if (hop.association) {
-              const next = (await loadAssociations(fromModel)).find(
-                (a) => a.name === hop.association
-              );
-              fromModel = next ? next.model : null;
-            } else {
-              fromModel = null;
-            }
+            fromModel = hop.relatedModel || null;
           }
 
           const addHopBtn = document.createElement('button');
@@ -700,26 +645,68 @@
           addHopBtn.textContent = '+ Hop';
           addHopBtn.disabled = !fromModel;
           addHopBtn.addEventListener('click', () => {
+            const prevLen = variables[index].hops.length;
+            const prevEffective = PM.effectiveValueSourceHop(variables[index]);
             variables[index].hops.push(PM.emptyHop());
-            if (variables[index].leaf) variables[index].leaf.field = null;
-            if (variables[index].itemFields) {
-              variables[index].itemFields.forEach((f) => {
-                f.field = null;
-              });
+            // Keep default "last hop" pinned so source does not jump to the empty new hop
+            if (
+              (variables[index].valueSourceHop === null ||
+                variables[index].valueSourceHop === undefined) &&
+              prevLen > 0 &&
+              prevEffective === prevLen - 1
+            ) {
+              variables[index].valueSourceHop = prevLen - 1;
+            } else {
+              PM.clampValueSourceHop(variables[index]);
             }
+            PM.clearValueFields(variables[index]);
             PM.syncMirrors(variables[index]);
             renderVariableList();
           });
           editor.appendChild(addHopBtn);
 
+          const sourceIdx = PM.effectiveValueSourceHop(variables[index]);
+          const sourceModel =
+            sourceIdx === null
+              ? fromModel
+              : PM.modelAtValueSource(v.rootModel, v.hops, sourceIdx);
+
+          const valueFromLab = document.createElement('label');
+          valueFromLab.className = 'field';
+          valueFromLab.innerHTML = '<span>Value from</span>';
+          const valueFromSel = document.createElement('select');
+          valueFromSel.setAttribute('aria-label', 'Value source model on path');
+          const rootOpt = document.createElement('option');
+          rootOpt.value = '-1';
+          rootOpt.textContent = `${v.rootModel || 'Root'} (root)`;
+          if (sourceIdx === -1) rootOpt.selected = true;
+          valueFromSel.appendChild(rootOpt);
+          (v.hops || []).forEach((hop, hopIdx) => {
+            if (!hop.relatedModel) return;
+            const o = document.createElement('option');
+            o.value = String(hopIdx);
+            o.textContent = `${hop.relatedModel} (hop ${hopIdx + 1})`;
+            if (sourceIdx === hopIdx) o.selected = true;
+            valueFromSel.appendChild(o);
+          });
+          valueFromSel.addEventListener('change', () => {
+            const next = Number(valueFromSel.value);
+            variables[index].valueSourceHop = Number.isInteger(next) ? next : null;
+            PM.clearValueFields(variables[index]);
+            PM.syncMirrors(variables[index]);
+            renderVariableList();
+          });
+          valueFromLab.appendChild(valueFromSel);
+          editor.appendChild(valueFromLab);
+
           if (v.kind === 'scalar') {
             const leafLab = document.createElement('label');
             leafLab.className = 'field';
-            leafLab.innerHTML = '<span>Leaf field</span>';
+            leafLab.innerHTML = '<span>Value field</span>';
             const leafSel = document.createElement('select');
             leafLab.appendChild(leafSel);
             editor.appendChild(leafLab);
-            await populateFields(leafSel, fromModel, v.leaf && v.leaf.field);
+            await populateFields(leafSel, sourceModel, v.leaf && v.leaf.field);
             leafSel.addEventListener('change', () => {
               variables[index].leaf = { field: leafSel.value || null };
               touchVar(index, li);
@@ -742,7 +729,7 @@
               lab.appendChild(sel);
               row.appendChild(lab);
               itemFieldsList.appendChild(row);
-              await populateFields(sel, fromModel, f.field);
+              await populateFields(sel, sourceModel, f.field);
               sel.addEventListener('change', () => {
                 variables[index].itemFields[fi].field = sel.value || null;
                 touchVar(index, li);

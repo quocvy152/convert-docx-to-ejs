@@ -4,7 +4,7 @@ const { sequelize } = require('../db/models');
 const {
   listAllowedModels,
   getAllowedModel,
-  listAssociationsForModel,
+  tableNameToModelMap,
 } = require('../config/modelAllowlist');
 
 async function tableExists(tableName) {
@@ -80,7 +80,10 @@ async function listFieldsForModel(modelName) {
   };
 }
 
-async function listAssociations(modelName) {
+/**
+ * Related allowlisted models via MySQL FK (outgoing + incoming), deduped by model name.
+ */
+async function listRelatedModels(modelName) {
   const model = getAllowedModel(modelName);
   if (!model) {
     const err = new Error(`Model not in allowlist: ${modelName}`);
@@ -88,25 +91,62 @@ async function listAssociations(modelName) {
     throw err;
   }
 
-  const associations = listAssociationsForModel(modelName) || [];
-  return Promise.all(
-    associations.map(async (a) => {
-      const related = getAllowedModel(a.model);
-      const resolved = related ? await resolveTableName(related) : null;
-      return {
-        name: a.name,
-        model: a.model,
-        available: Boolean(resolved),
-      };
-    })
-  ).then((rows) => ({
+  const tableName = await resolveTableName(model);
+  if (!tableName) {
+    return { model: model.name, table: null, relatedModels: [] };
+  }
+
+  const tableToModel = tableNameToModelMap();
+
+  const [outgoing] = await sequelize.query(
+    `SELECT DISTINCT REFERENCED_TABLE_NAME AS relatedTable
+     FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+     WHERE TABLE_SCHEMA = DATABASE()
+       AND TABLE_NAME = :tableName
+       AND REFERENCED_TABLE_NAME IS NOT NULL`,
+    { replacements: { tableName } }
+  );
+
+  const [incoming] = await sequelize.query(
+    `SELECT DISTINCT TABLE_NAME AS relatedTable
+     FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+     WHERE TABLE_SCHEMA = DATABASE()
+       AND REFERENCED_TABLE_NAME = :tableName
+       AND TABLE_NAME IS NOT NULL`,
+    { replacements: { tableName } }
+  );
+
+  /** @type {Map<string, { name: string, table: string, available: boolean }>} */
+  const byRelated = new Map();
+
+  const addRelated = (relatedTable) => {
+    if (!relatedTable) return;
+    const relatedModelName = tableToModel.get(String(relatedTable).toLowerCase());
+    if (!relatedModelName || relatedModelName === model.name) return;
+    if (byRelated.has(relatedModelName)) return;
+    byRelated.set(relatedModelName, {
+      name: relatedModelName,
+      table: relatedTable,
+      available: true,
+    });
+  };
+
+  for (const row of outgoing || []) addRelated(row.relatedTable);
+  for (const row of incoming || []) addRelated(row.relatedTable);
+
+  const relatedModels = [...byRelated.values()].sort((a, b) =>
+    a.name.localeCompare(b.name)
+  );
+
+  return {
     model: model.name,
-    associations: rows,
-  }));
+    table: tableName,
+    relatedModels,
+  };
 }
 
 module.exports = {
   listModels,
   listFieldsForModel,
-  listAssociations,
+  listRelatedModels,
 };
